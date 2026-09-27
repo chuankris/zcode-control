@@ -1,0 +1,412 @@
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { basename, join, resolve, sep } from "node:path";
+
+import { captureCommand, type CommandResult } from "./command.ts";
+
+const launchServicesRegister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+const managedBundlePrefix = "dev.zcode.cli.oauth-callback.";
+const managedAppPrefix = "ZCode CLI OAuth Callback ";
+const defaultTimeoutMs = 5 * 60_000;
+const staleRecoveryMs = defaultTimeoutMs + 60_000;
+
+const currentHandlerScript = String.raw`
+ObjC.import("AppKit");
+function run(argv) {
+  const url = $.NSURL.URLWithString(argv[0] + "://");
+  const appUrl = $.NSWorkspace.sharedWorkspace.URLForApplicationToOpenURL(url);
+  if (!appUrl || appUrl.isNil()) return "";
+  const bundle = $.NSBundle.bundleWithURL(appUrl);
+  return !bundle || bundle.isNil() ? "" : ObjC.unwrap(bundle.bundleIdentifier);
+}
+`;
+
+const setHandlerScript = String.raw`
+ObjC.import("CoreServices");
+function run(argv) {
+  return String(Number($.LSSetDefaultHandlerForURLScheme($(argv[0]), $(argv[1]))));
+}
+`;
+
+export type CommandRunner = (command: string, args: string[]) => Promise<CommandResult>;
+
+interface RecoveryRecord {
+  appPath: string;
+  bundleId: string;
+  createdAt?: number;
+  pid: number;
+  previousHandler: string;
+  scheme: string;
+}
+
+export interface DarwinUrlCallbackReceiver {
+  dispose(): Promise<void>;
+  waitForCallback(signal?: AbortSignal, timeoutMs?: number): Promise<string>;
+}
+
+export interface DarwinUrlCallbackOptions {
+  env?: NodeJS.ProcessEnv;
+  runCommand?: CommandRunner;
+  scheme: string;
+}
+
+async function runCommand(command: string, args: string[]): Promise<CommandResult> {
+  return await captureCommand(command, args);
+}
+
+async function checkedRun(
+  runner: CommandRunner,
+  command: string,
+  args: string[]
+): Promise<string> {
+  const result = await runner(command, args);
+  if (result.code !== 0) {
+    const diagnostic = result.stderr.trim() || result.stdout.trim() || `status ${result.code}`;
+    throw new Error(`${basename(command)} failed: ${diagnostic}`);
+  }
+  return result.stdout.trim();
+}
+
+async function currentDefaultHandler(
+  runner: CommandRunner,
+  scheme: string,
+  step = "reading current OAuth callback handler"
+): Promise<string> {
+  return withStepContext(step, () => checkedRun(runner, "/usr/bin/osascript", [
+    "-l",
+    "JavaScript",
+    "-e",
+    currentHandlerScript,
+    scheme
+  ]));
+}
+
+async function setDefaultHandler(
+  runner: CommandRunner,
+  scheme: string,
+  bundleId: string,
+  step = "activating OAuth callback handler"
+): Promise<void> {
+  await withStepContext(step, async () => {
+    const status = await checkedRun(runner, "/usr/bin/osascript", [
+      "-l",
+      "JavaScript",
+      "-e",
+      setHandlerScript,
+      scheme,
+      bundleId
+    ]);
+    if (status !== "0") throw new Error(`Unable to register the ${scheme} callback handler (status ${status}).`);
+  });
+}
+
+function appleScriptString(value: string): string {
+  return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+export function callbackAppleScript(
+  callbackPath: string,
+  scheme: string,
+  previousHandler: string
+): string[] {
+  const restoreCommand = [
+    "/usr/bin/osascript",
+    "-l",
+    "JavaScript",
+    "-e",
+    setHandlerScript,
+    scheme,
+    previousHandler || "none"
+  ].map(shellQuote).join(" ");
+  return [
+    "on open location theURL",
+    `set outputFile to POSIX file ${appleScriptString(callbackPath)}`,
+    "try",
+    "set fileHandle to open for access outputFile with write permission",
+    "set eof fileHandle to 0",
+    // The trailing linefeed terminates the record so the reader can tell a
+    // complete URL from a truncate-then-write in progress.
+    "write (theURL & linefeed) to fileHandle as «class utf8»",
+    "close access fileHandle",
+    "on error",
+    "try",
+    "close access outputFile",
+    "end try",
+    "end try",
+    "try",
+    `do shell script ${appleScriptString(restoreCommand)}`,
+    "end try",
+    "quit",
+    "end open location"
+  ];
+}
+
+function recoveryPath(home: string): string {
+  return join(home, ".zcode", "cli", "oauth-handler-recovery.json");
+}
+
+function applicationsDirectory(home: string): string {
+  return join(home, "Applications");
+}
+
+function isManagedRecovery(record: unknown, home: string): record is RecoveryRecord {
+  if (!record || typeof record !== "object") return false;
+  const value = record as Partial<RecoveryRecord>;
+  if (typeof value.appPath !== "string"
+    || typeof value.bundleId !== "string"
+    || typeof value.pid !== "number"
+    || typeof value.previousHandler !== "string"
+    || typeof value.scheme !== "string") return false;
+  const appRoot = `${resolve(applicationsDirectory(home))}${sep}`;
+  return resolve(value.appPath).startsWith(appRoot)
+    && basename(value.appPath).startsWith(managedAppPrefix)
+    && value.bundleId.startsWith(managedBundlePrefix);
+}
+
+function processIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readRecovery(home: string): Promise<RecoveryRecord | null> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(recoveryPath(home), "utf8"));
+    return isManagedRecovery(parsed, home) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function unregisterApp(runner: CommandRunner, appPath: string): Promise<void> {
+  await runner(launchServicesRegister, ["-u", appPath]).catch(() => ({
+    code: 1,
+    stderr: "",
+    stdout: ""
+  }));
+}
+
+export async function recoverStaleDarwinOAuthHandler(
+  options: DarwinUrlCallbackOptions
+): Promise<void> {
+  const runner = options.runCommand ?? runCommand;
+  const home = options.env?.HOME || homedir();
+  const path = recoveryPath(home);
+  const record = await readRecovery(home);
+  if (!record) {
+    await rm(path, { force: true });
+    return;
+  }
+  // A recycled PID must not block login forever: no live login can outlast the
+  // authorization timeout, so an older record is stale regardless of its PID.
+  const age = typeof record.createdAt === "number" ? Date.now() - record.createdAt : Infinity;
+  if (record.pid !== process.pid && processIsAlive(record.pid) && age < staleRecoveryMs) {
+    throw new Error("Another Z.AI login is already waiting for authorization.");
+  }
+  const current = await currentDefaultHandler(runner, record.scheme).catch(() => "");
+  if (current === record.bundleId) {
+    await setDefaultHandler(
+      runner,
+      record.scheme,
+      record.previousHandler || "none",
+      "restoring stale OAuth callback handler"
+    );
+  }
+  await unregisterApp(runner, record.appPath);
+  await rm(record.appPath, { recursive: true, force: true });
+  await rm(path, { force: true });
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("Login cancelled.");
+}
+
+async function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw abortReason(signal);
+  await new Promise<void>((resolveDelay, rejectDelay) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolveDelay();
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timer);
+      rejectDelay(abortReason(signal!));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function withStepContext<T>(
+  step: string,
+  action: () => Promise<T>
+): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${step}: ${detail}`, { cause: error });
+  }
+}
+
+export async function createDarwinUrlCallbackReceiver(
+  options: DarwinUrlCallbackOptions
+): Promise<DarwinUrlCallbackReceiver> {
+  if (process.platform !== "darwin") {
+    throw new Error("The native zcode:// callback receiver is only available on macOS.");
+  }
+  if (!/^[a-z][a-z0-9+.-]*$/u.test(options.scheme)) {
+    throw new Error(`Invalid callback scheme: ${options.scheme}`);
+  }
+
+  const runner = options.runCommand ?? runCommand;
+  const home = options.env?.HOME || homedir();
+  await recoverStaleDarwinOAuthHandler({ ...options, runCommand: runner });
+
+  const nonce = crypto.randomUUID().replaceAll("-", "");
+  const shortNonce = nonce.slice(0, 10);
+  const bundleId = `${managedBundlePrefix}${nonce}`;
+  const appPath = join(applicationsDirectory(home), `${managedAppPrefix}${shortNonce}.app`);
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "zcode-cli-oauth-"));
+  const callbackPath = join(temporaryDirectory, "callback.url");
+  const recovery = recoveryPath(home);
+  let previousHandler = "";
+  let handlerChanged = false;
+  let disposePromise: Promise<void> | undefined;
+
+  const cleanup = async (): Promise<void> => {
+    let handlerOwned = true;
+    if (handlerChanged) {
+      const current = await currentDefaultHandler(runner, options.scheme).catch(() => bundleId);
+      handlerOwned = current === bundleId;
+      if (handlerOwned) {
+        const restored = await setDefaultHandler(runner, options.scheme, previousHandler || "none")
+          .then(() => true)
+          .catch(() => false);
+        // Leave the app bundle and the recovery record in place when the scheme
+        // still points at us, so the next login can finish the restore instead
+        // of stranding zcode:// on a deleted bundle.
+        if (!restored) {
+          await rm(temporaryDirectory, { recursive: true, force: true });
+          return;
+        }
+      }
+    }
+    await unregisterApp(runner, appPath);
+    await rm(appPath, { recursive: true, force: true });
+    await rm(temporaryDirectory, { recursive: true, force: true });
+    const record = await readRecovery(home);
+    if (record?.bundleId === bundleId) await rm(recovery, { force: true });
+  };
+
+  try {
+    previousHandler = await currentDefaultHandler(runner, options.scheme);
+    await mkdir(applicationsDirectory(home), { recursive: true });
+    await mkdir(join(home, ".zcode", "cli"), { recursive: true });
+    await writeFile(callbackPath, "", { mode: 0o600 });
+    await chmod(callbackPath, 0o600);
+
+    const compileArgs = ["-o", appPath];
+    for (const line of callbackAppleScript(callbackPath, options.scheme, previousHandler)) {
+      compileArgs.push("-e", line);
+    }
+    await withStepContext("compiling OAuth callback app", () =>
+      checkedRun(runner, "/usr/bin/osacompile", compileArgs)
+    );
+
+    const infoPlist = join(appPath, "Contents", "Info.plist");
+    await withStepContext("setting CFBundleIdentifier", () =>
+      checkedRun(runner, "/usr/bin/plutil", [
+        "-insert",
+        "CFBundleIdentifier",
+        "-string",
+        bundleId,
+        infoPlist
+      ])
+    );
+    await withStepContext("setting LSUIElement", () =>
+      checkedRun(runner, "/usr/bin/plutil", [
+        "-insert",
+        "LSUIElement",
+        "-bool",
+        "true",
+        infoPlist
+      ])
+    );
+    await withStepContext("setting CFBundleURLTypes", () =>
+      checkedRun(runner, "/usr/bin/plutil", [
+        "-insert",
+        "CFBundleURLTypes",
+        "-json",
+        JSON.stringify([{
+          CFBundleTypeRole: "Viewer",
+          CFBundleURLName: "ZCode CLI OAuth Callback",
+          CFBundleURLSchemes: [options.scheme]
+        }]),
+        infoPlist
+      ])
+    );
+    await withStepContext("ad-hoc codesigning callback app", () =>
+      checkedRun(runner, "/usr/bin/codesign", ["--force", "--deep", "--sign", "-", appPath])
+    );
+    await withStepContext("registering callback app with LaunchServices", () =>
+      checkedRun(runner, launchServicesRegister, ["-f", appPath])
+    );
+
+    const record: RecoveryRecord = {
+      appPath,
+      bundleId,
+      createdAt: Date.now(),
+      pid: process.pid,
+      previousHandler,
+      scheme: options.scheme
+    };
+    await writeFile(recovery, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    await chmod(recovery, 0o600);
+    await setDefaultHandler(runner, options.scheme, bundleId);
+    handlerChanged = true;
+    const registered = await currentDefaultHandler(
+      runner,
+      options.scheme,
+      "verifying OAuth callback handler"
+    );
+    if (registered !== bundleId) {
+      throw new Error(
+        `macOS did not activate the ${options.scheme} callback handler.`
+        + " Remove stale `ZCode CLI OAuth Callback *.app` entries from"
+        + " `~/Applications`, then retry `zcode login`."
+      );
+    }
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+
+  return {
+    dispose() {
+      return disposePromise ??= cleanup();
+    },
+    async waitForCallback(signal, timeoutMs = defaultTimeoutMs) {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < timeoutMs) {
+        if (signal?.aborted) throw abortReason(signal);
+        const callback = await readFile(callbackPath, "utf8").catch(() => "");
+        if (callback.includes("\n") && callback.trim()) return callback.trim();
+        await delay(100, signal);
+      }
+      throw new Error(
+        "Authorization timed out. Please retry `zcode login`."
+        + " If the browser routed the callback elsewhere, check for a stale"
+        + " `ZCode CLI OAuth Callback *.app` entry in `~/Applications` and"
+        + " remove it before retrying."
+      );
+    }
+  };
+}

@@ -1,0 +1,10 @@
+node_modules/
+vendor/
+packages/zcode-tui/dist/
+relay/dist/
+bin/zcode.js
+.vendor-next/
+.release/
+.zcode/
+*.tgz
+.DS_Store

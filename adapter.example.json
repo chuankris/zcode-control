@@ -1,0 +1,7 @@
+{
+  "remoteClientRoot": "D:/zcode-control/remote-client",
+  "connectionUrlFile": "D:/zcode-private/remote-url.txt",
+  "workspaceSelection": "session",
+  "siteName": "Local ZCode",
+  "stateDir": "D:/zcode-private/adapter-state"
+}

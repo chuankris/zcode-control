@@ -1,0 +1,486 @@
+import { describe, expect, test } from "bun:test";
+
+import {
+  historyText,
+  isModelCancellationEvent,
+  modelLabel,
+  normalizeEvent,
+  restoredMessages
+} from "../packages/zcode-tui/src/events.ts";
+
+describe("ZCode event adapter", () => {
+  test("distinguishes a cancelled model request from a real model failure", () => {
+    const cancelled = normalizeEvent({
+      type: "model.network_status",
+      payload: {
+        type: "model_request_failed",
+        errorCode: "model_request_cancelled",
+        exceptionType: "AbortError",
+        message: "Model request was cancelled.",
+        reason: "cancelled",
+        retryable: false
+      }
+    });
+    const failed = normalizeEvent({
+      type: "model.network_status",
+      payload: {
+        type: "model_request_failed",
+        message: "Provider unavailable.",
+        reason: "server_error",
+        retryable: false
+      }
+    });
+
+    expect(cancelled).toMatchObject({
+      type: "model_request_failed",
+      errorCode: "model_request_cancelled",
+      exceptionType: "AbortError",
+      reason: "cancelled",
+      retryable: false
+    });
+    expect(cancelled && isModelCancellationEvent(cancelled)).toBeTrue();
+    expect(failed && isModelCancellationEvent(failed)).toBeFalse();
+  });
+
+  test("normalizes protocol streaming events", () => {
+    expect(normalizeEvent({
+      id: "event_stream_delta",
+      type: "model.streaming",
+      payload: {
+        id: "message_entity",
+        kind: "text_delta",
+        delta: "你好"
+      }
+    })).toMatchObject({
+      eventId: "event_stream_delta",
+      type: "model.streaming",
+      kind: "text_delta",
+      delta: "你好"
+    });
+  });
+
+  test("uses the official assistant message identity and result duration", () => {
+    expect(normalizeEvent({
+      type: "model.streaming",
+      payload: {
+        kind: "tool_call",
+        assistantMessageId: "message_assistant",
+        toolCallId: "call_1",
+        toolName: "Bash"
+      }
+    })).toMatchObject({
+      messageId: "message_assistant",
+      toolCallId: "call_1"
+    });
+
+    expect(normalizeEvent({
+      type: "tool_call_result",
+      payload: {
+        toolCallId: "call_1",
+        duration: 1_250,
+        result: { success: true }
+      }
+    })).toMatchObject({
+      durationMs: 1_250,
+      progress: { durationMs: 1_250 }
+    });
+  });
+
+  test("normalizes app-server envelopes", () => {
+    expect(normalizeEvent({
+      method: "session/event",
+      params: {
+        type: "model.streaming",
+        payload: {
+          kind: "tool_input_start",
+          toolName: "Read",
+          toolCallId: "call_1"
+        }
+      }
+    })).toMatchObject({
+      type: "model.streaming",
+      kind: "tool_input_start",
+      toolName: "Read",
+      toolCallId: "call_1"
+    });
+  });
+
+  test("normalizes raw autonomous turn lifecycle metadata and failures", () => {
+    expect(normalizeEvent({
+      id: "event_background_start",
+      type: "turn_started",
+      turnId: "turn_background",
+      payload: {
+        inputSource: "background_task",
+        originMeta: { workId: "task_background", workIds: ["task_background", "task_two"] }
+      }
+    })).toMatchObject({
+      eventId: "event_background_start",
+      type: "turn_started",
+      turnId: "turn_background",
+      inputSource: "background_task",
+      taskId: "task_background",
+      taskIds: ["task_background", "task_two"]
+    });
+
+    expect(normalizeEvent({
+      id: "event_background_failure",
+      type: "turn_error",
+      turnId: "turn_background",
+      payload: { error: { message: "Background result failed." } }
+    })).toMatchObject({
+      eventId: "event_background_failure",
+      type: "turn_error",
+      turnId: "turn_background",
+      message: "Background result failed."
+    });
+
+    expect(normalizeEvent({
+      id: "event_agent_reply",
+      type: "subagent_message",
+      payload: {
+        agentId: "agent_background",
+        agentType: "reviewer",
+        childSessionId: "child_background",
+        status: "failed",
+        summaryText: "Review failed after the final tool call."
+      }
+    })).toMatchObject({
+      agentId: "agent_background",
+      agentType: "reviewer",
+      childSessionId: "child_background",
+      taskStatus: "failed",
+      message: "Review failed after the final tool call."
+    });
+  });
+
+  test("uses nested runtime model-network event types and retry metadata", () => {
+    expect(normalizeEvent({
+      type: "model.network_status",
+      payload: {
+        type: "model_retry_scheduled",
+        attempt: 1,
+        nextAttempt: 2,
+        maxAttempts: 6,
+        delayMs: 2_000,
+        retryable: true,
+        message: "Provider overloaded"
+      }
+    })).toMatchObject({
+      type: "model_retry_scheduled",
+      attempt: 1,
+      nextAttempt: 2,
+      maxAttempts: 6,
+      delayMs: 2_000,
+      retryable: true,
+      message: "Provider overloaded"
+    });
+
+    expect(normalizeEvent({
+      type: "model.network_status",
+      payload: {
+        type: "model_stream_stalled",
+        idleMs: 60_000,
+        timeoutMs: 60_000
+      }
+    })).toMatchObject({
+      type: "model_stream_stalled",
+      idleMs: 60_000,
+      timeoutMs: 60_000
+    });
+
+    expect(normalizeEvent({
+      type: "streamRecovery.updated",
+      payload: {
+        streamRecovery: {
+          retryNumber: 2,
+          maxRetries: 5
+        }
+      }
+    })).toMatchObject({
+      type: "streamRecovery.updated",
+      attempt: 2,
+      maxRetries: 5
+    });
+  });
+
+  test("normalizes raw runtime tool lifecycle events", () => {
+    expect(normalizeEvent({
+      type: "tool_call_started",
+      payload: {
+        toolCallId: "call_1",
+        toolName: "Read",
+        startedAt: 1_752_400_000_000
+      }
+    })).toMatchObject({
+      type: "tool_call_started",
+      kind: "started",
+      toolCallId: "call_1",
+      toolName: "Read"
+    });
+
+    expect(normalizeEvent({
+      type: "tool_call_result",
+      payload: {
+        toolCallId: "call_1",
+        result: { success: true, content: "source text" }
+      }
+    })).toMatchObject({
+      type: "tool_call_result",
+      kind: "result",
+      toolCallId: "call_1",
+      result: { success: true, content: "source text" }
+    });
+
+    expect(normalizeEvent({
+      type: "tool_call_error",
+      payload: {
+        toolCallId: "call_2",
+        error: { message: "Command failed" }
+      }
+    })).toMatchObject({
+      type: "tool_call_error",
+      kind: "error",
+      toolCallId: "call_2",
+      error: { message: "Command failed" }
+    });
+  });
+
+  test("normalizes the pending and committed identities for active-turn steering", () => {
+    expect(normalizeEvent({
+      method: "session/event",
+      params: {
+        type: "turn_started",
+        turnId: "turn_1",
+        payload: { inputId: "input_primary" }
+      }
+    })).toMatchObject({
+      type: "turn_started",
+      turnId: "turn_1",
+      inputId: "input_primary"
+    });
+
+    expect(normalizeEvent({
+      type: "turn_steer_queued",
+      payload: {
+        inputId: "input_1",
+        pendingInputId: "pending_1",
+        targetTurnId: "turn_1"
+      }
+    })).toMatchObject({
+      type: "turn_steer_queued",
+      inputId: "input_1",
+      pendingInputId: "pending_1",
+      targetTurnId: "turn_1"
+    });
+
+    expect(normalizeEvent({
+      type: "turn_steer_drained",
+      payload: {
+        pendingInputIds: ["pending_1"],
+        injectedMessageIds: ["message_steer_1"],
+        targetTurnId: "turn_1"
+      }
+    })).toMatchObject({
+      type: "turn_steer_drained",
+      pendingInputIds: ["pending_1"],
+      injectedMessageIds: ["message_steer_1"],
+      targetTurnId: "turn_1"
+    });
+  });
+
+  test("reports only the progress fields an event actually carries", () => {
+    const started = normalizeEvent({
+      type: "tool_call_started",
+      payload: { toolCallId: "call_1", toolName: "Bash", pid: 4_242, description: "bun test" }
+    });
+    expect(started?.progress).toStrictEqual({ pid: 4_242, description: "bun test" });
+
+    const closed = normalizeEvent({
+      type: "tool_call_closed",
+      payload: { toolCallId: "call_1" }
+    });
+    expect(closed?.progress).toStrictEqual({});
+  });
+
+  test("normalizes subagent lifecycle metadata for the parent tool card", () => {
+    expect(normalizeEvent({
+      type: "subagent_stopped",
+      payload: {
+        parentToolCallId: "call_agent",
+        agentId: "agent_1",
+        agentType: "explore",
+        childSessionId: "session_child",
+        totalToolUseCount: 4,
+        totalTokens: 2_000,
+        outputFile: "/tmp/agent.output"
+      }
+    })?.progress).toMatchObject({
+      parentToolCallId: "call_agent",
+      agentId: "agent_1",
+      agentType: "explore",
+      childSessionId: "session_child",
+      totalToolUseCount: 4,
+      totalTokens: 2_000,
+      outputFile: "/tmp/agent.output"
+    });
+  });
+
+  test("formats model, history and restored transcript shapes", () => {
+    expect(modelLabel({ providerId: "zai", modelId: "glm-5" })).toBe("zai/glm-5");
+    expect(historyText({ text: "previous prompt" })).toBe("previous prompt");
+    expect(restoredMessages([
+      { info: { role: "user" }, parts: [{ text: "hello" }] },
+      { info: { role: "assistant" }, parts: [{ text: "world" }] }
+    ])).toEqual([
+      { role: "user", parts: [{ type: "text", text: "hello" }] },
+      { role: "assistant", parts: [{ type: "text", text: "world" }] }
+    ]);
+  });
+
+  test("preserves official rich transcript parts", () => {
+    expect(restoredMessages([{
+      info: { role: "agent" },
+      content: "final answer",
+      parts: [
+        { type: "text", text: "final answer" },
+        { type: "thought", text: "reasoning" },
+        {
+          type: "tool",
+          toolCallId: "call_1",
+          toolName: "Bash",
+          input: { command: "bun test" },
+          output: "ok",
+          status: "completed"
+        }
+      ]
+    }])).toEqual([{
+      role: "assistant",
+      parts: [
+        { type: "text", text: "final answer" },
+        { type: "thought", text: "reasoning" },
+        {
+          type: "tool",
+          toolCallId: "call_1",
+          toolName: "Bash",
+          input: { command: "bun test" },
+          output: "ok",
+          resultDisplay: undefined,
+          error: undefined,
+        status: "completed",
+        title: undefined,
+        parentToolCallId: undefined,
+        childToolCallId: undefined,
+        agentId: undefined,
+        agentType: undefined,
+        childSessionId: undefined
+        }
+      ]
+    }]);
+  });
+
+  test("reads official nested tool state without losing failures or inputs", () => {
+    expect(restoredMessages([{
+      info: { role: "assistant", messageId: "message_1" },
+      parts: [{
+        type: "tool",
+        partId: "part_1",
+        messageId: "message_1",
+        sessionId: "session_1",
+        callId: "call_1",
+        tool: "Bash",
+        state: {
+          status: "error",
+          input: { command: "false" },
+          error: "Command exited with code 1",
+          startedAt: "2026-07-14T00:00:00Z",
+          completedAt: "2026-07-14T00:00:01Z"
+        }
+      }]
+    }])).toEqual([{
+      messageId: "message_1",
+      role: "assistant",
+      parts: [{
+        partId: "part_1",
+        messageId: "message_1",
+        sessionId: "session_1",
+        type: "tool",
+        toolCallId: "call_1",
+        toolName: "Bash",
+        input: { command: "false" },
+        output: undefined,
+        resultDisplay: undefined,
+        error: "Command exited with code 1",
+        status: "error",
+        title: undefined,
+        metadata: undefined,
+        parentToolCallId: undefined,
+        childToolCallId: undefined,
+        agentId: undefined,
+        agentType: undefined,
+        childSessionId: undefined
+      }]
+    }]);
+  });
+
+  test("preserves restored tool relationships from state metadata", () => {
+    expect(restoredMessages([{
+      info: { role: "assistant" },
+      parts: [{
+        type: "tool",
+        callId: "child_1",
+        tool: "Read",
+        state: {
+          status: "completed",
+          metadata: {
+            parentToolCallId: "agent_1",
+            agentId: "researcher",
+            agentType: "explore",
+            childSessionId: "session_child"
+          }
+        }
+      }]
+    }])[0]?.parts[0]).toMatchObject({
+      type: "tool",
+      toolCallId: "child_1",
+      parentToolCallId: "agent_1",
+      agentId: "researcher",
+      agentType: "explore",
+      childSessionId: "session_child"
+    });
+  });
+
+  test("normalizes official part mutation events", () => {
+    expect(normalizeEvent({
+      type: "part.upserted",
+      payload: {
+        part: {
+          type: "text",
+          partId: "part_text",
+          messageId: "message_1",
+          sessionId: "session_1",
+          text: "updated"
+        }
+      }
+    })).toMatchObject({
+      type: "part.upserted",
+      partId: "part_text",
+      messageId: "message_1",
+      part: { type: "text", text: "updated" }
+    });
+
+    expect(normalizeEvent({
+      method: "session/event",
+      params: {
+        type: "part.delta",
+        payload: { messageId: "message_1", partId: "part_text", field: "text", delta: "!" }
+      }
+    })).toMatchObject({
+      type: "part.delta",
+      messageId: "message_1",
+      partId: "part_text",
+      field: "text",
+      delta: "!"
+    });
+  });
+});

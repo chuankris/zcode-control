@@ -1,0 +1,113 @@
+{
+  "provider": {
+    "zai": {
+      "kind": "anthropic",
+      "name": "Z.AI Coding Plan",
+      "options": {
+        "apiKeyRequired": true,
+        "baseURL": "https://api.z.ai/api/anthropic"
+      },
+      "headers": {},
+      "models": {
+        "glm-5.2": {
+          "name": "GLM-5.2"
+        },
+        "glm-5.1": {
+          "name": "GLM-5.1"
+        }
+      }
+    }
+  },
+  "model": {
+    "main": "zai/glm-5.2",
+    "lite": "zai/glm-5.1"
+  },
+  "modelCatalog": {
+    "overrides": {}
+  },
+  "modelStream": {
+    "idleTimeoutMs": 60000
+  },
+  "permission": {
+    "mode": "build",
+    "allowedTools": [],
+    "disallowedTools": [],
+    "autoApproveHighRisk": false,
+    "allowMediumRiskInAuto": false
+  },
+  "storage": {
+    "dir": "~/.zcode",
+    "sessionDbPath": "~/.zcode/cli/db/db.sqlite"
+  },
+  "network": {
+    "timeout": 180000
+  },
+  "features": {
+    "compact": true,
+    "rewind": true,
+    "subagent": true,
+    "memory": true,
+    "skill": true,
+    "mcp": true
+  },
+  "subagents": {
+    "autoBackgroundMs": 1000
+  },
+  "memory": {
+    "use": true,
+    "write": true,
+    "autoConsolidate": true,
+    "summaryMaxBytes": 8192
+  },
+  "mcp": {
+    "servers": {}
+  },
+  "plugins": {
+    "enabled": true,
+    "dirs": [],
+    "enabledPlugins": {},
+    "options": {},
+    "suppressedBuiltins": []
+  },
+  "skills": {
+    "enabled": true,
+    "includeInstructions": true,
+    "metadataBudget": 20000,
+    "roots": []
+  },
+  "skill": {},
+  "command": {},
+  "logging": {
+    "level": "info",
+    "format": "text"
+  },
+  "ui": {
+    "locale": "auto",
+    "theme": "auto",
+    "notifications": {
+      "method": "auto",
+      "condition": "unfocused"
+    }
+  },
+  "toolConcurrency": {
+    "maxConcurrency": 10
+  },
+  "modelAnomalyGuard": {
+    "repeatedToolCallWarningThreshold": 3,
+    "maxBudgetWarningsPerTurn": 3
+  },
+  "hooks": {
+    "enabled": false,
+    "timeoutMs": 60000,
+    "maxOutputBytes": 32768,
+    "events": {
+      "SessionStart": [],
+      "UserPromptSubmit": [],
+      "PreToolUse": [],
+      "PermissionRequest": [],
+      "PostToolUse": [],
+      "PostToolUseFailure": [],
+      "Stop": []
+    }
+  }
+}

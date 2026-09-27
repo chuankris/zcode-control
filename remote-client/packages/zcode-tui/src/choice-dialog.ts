@@ -1,0 +1,540 @@
+import {
+  decodeKittyPrintable,
+  Editor,
+  getKeybindings,
+  Input,
+  matchesKey,
+  SelectList,
+  truncateToWidth,
+  type Component,
+  type Container,
+  type SelectItem,
+  type TUI
+} from "@earendil-works/pi-tui";
+
+import type { ZCodeTheme } from "./theme.ts";
+import { isWindowedComponent } from "./renderable.ts";
+import {
+  sanitizeTerminalText,
+  removeLastGrapheme,
+  truncateTerminalText,
+  wrapTerminalText
+} from "./terminal-text.ts";
+
+export interface ChoiceItem extends SelectItem {
+  payload?: unknown;
+  preview?: Component;
+}
+
+interface DialogGeometry {
+  maxContentLines: number;
+  maxExpandedContentLines: number;
+  maxVisible: number;
+}
+
+function dialogGeometry(rows: number, itemCount: number, hasDetails: boolean): DialogGeometry {
+  const maxVisible = Math.max(1, Math.min(
+    8,
+    itemCount,
+    Math.floor(Math.max(2, rows - 8) / (hasDetails ? 2 : 1))
+  ));
+  const maxContentLines = Math.max(0, rows - maxVisible - 9);
+  return {
+    maxContentLines,
+    maxExpandedContentLines: Math.max(2, maxContentLines, rows - 8),
+    maxVisible
+  };
+}
+
+class ChoiceList extends SelectList {
+  /**
+   * pi-tui fixes the visible window at construction, so the dialog resizes it from
+   * its own render instead of freezing the height the terminal had at open time.
+   */
+  setMaxVisible(maxVisible: number): void {
+    (this as unknown as { maxVisible: number }).maxVisible = maxVisible;
+  }
+}
+
+class ChoiceItemDetails implements Component {
+  constructor(
+    private readonly item: ChoiceItem,
+    private readonly theme: ZCodeTheme
+  ) {}
+
+  render(width: number): string[] {
+    const safeWidth = Math.max(1, width);
+    const preview = this.item.preview?.render(safeWidth) ?? [];
+    return [
+      ...wrapTerminalText(this.theme.bold(this.item.label), safeWidth),
+      ...(this.item.description
+        ? wrapTerminalText(this.theme.muted(this.item.description), safeWidth)
+        : []),
+      ...(preview.length > 0 ? ["", ...preview] : [])
+    ];
+  }
+
+  invalidate(): void {
+    this.item.preview?.invalidate?.();
+  }
+}
+
+class ChoiceDialog implements Component {
+  private filter = "";
+  private selectionPreview?: Component;
+  private contentExpanded = false;
+  private contentOffset = 0;
+  private contentLineCount = 0;
+  private contentPageSize = 1;
+
+  constructor(
+    private readonly title: string,
+    private readonly prompt: string,
+    private readonly help: string,
+    private readonly list: ChoiceList,
+    private readonly theme: ZCodeTheme,
+    private readonly geometry: () => DialogGeometry,
+    private readonly content?: Component,
+    private readonly contentLabel = "Details"
+  ) {}
+
+  setSelectionPreview(preview: Component | undefined): void {
+    if (this.selectionPreview !== preview) this.contentOffset = 0;
+    this.selectionPreview = preview;
+  }
+
+  render(width: number): string[] {
+    const safeWidth = Math.max(1, width);
+    // Heights follow the terminal on every frame, so a resize while the dialog is
+    // open neither overflows the screen nor keeps a stale cramped viewport.
+    const geometry = this.geometry();
+    this.list.setMaxVisible(geometry.maxVisible);
+    const windowedContent = this.content && !this.selectionPreview && isWindowedComponent(this.content)
+      ? this.content
+      : undefined;
+    const content = windowedContent ? undefined : [
+      ...(this.content?.render(safeWidth) ?? []),
+      ...(this.content && this.selectionPreview ? [""] : []),
+      ...(this.selectionPreview?.render(safeWidth) ?? [])
+    ];
+    const totalContentLines = windowedContent
+      ? windowedContent.renderWindow(safeWidth, 0, 0).totalLines
+      : content?.length ?? 0;
+    const visibleContent = this.renderContentViewport(
+      totalContentLines,
+      this.contentExpanded ? geometry.maxExpandedContentLines : geometry.maxContentLines,
+      safeWidth,
+      (start, count) => windowedContent
+        ? windowedContent.renderWindow(safeWidth, start, count).lines
+        : content?.slice(start, start + count) ?? []
+    );
+    if (this.contentExpanded && totalContentLines > 0) {
+      return [
+        ...wrapTerminalText(
+          `${this.theme.bold(this.title)} ${this.theme.accent(`· ${this.contentLabel}`)}`,
+          safeWidth
+        ),
+        ...wrapTerminalText(this.theme.muted(this.prompt), safeWidth),
+        "",
+        ...visibleContent,
+        "",
+        ...wrapTerminalText(
+          this.theme.muted("Up/Down scroll · ←/→ or PgUp/PgDn page · Home/End jump · Ctrl+O or Esc return"),
+          safeWidth
+        )
+      ];
+    }
+    return [
+      ...wrapTerminalText(this.theme.bold(this.title), safeWidth),
+      ...wrapTerminalText(this.theme.muted(this.prompt), safeWidth),
+      ...(visibleContent.length > 0 ? ["", ...visibleContent] : []),
+      truncateTerminalText(
+        `${this.theme.muted("Filter:")} ${this.filter || this.theme.muted("type to search")}`,
+        safeWidth
+      ),
+      "",
+      ...this.list.render(safeWidth),
+      "",
+      ...wrapTerminalText(this.theme.muted(this.help), safeWidth)
+    ];
+  }
+
+  handleInput(data: string): void {
+    const keybindings = getKeybindings();
+    if (matchesKey(data, "ctrl+o") && this.contentLineCount > 0) {
+      this.contentExpanded = !this.contentExpanded;
+      return;
+    }
+    if (this.contentExpanded) {
+      if (matchesKey(data, "escape")) {
+        this.contentExpanded = false;
+        return;
+      }
+      if (keybindings.matches(data, "tui.select.up")) {
+        this.scrollContent(-1);
+        return;
+      }
+      if (keybindings.matches(data, "tui.select.down")) {
+        this.scrollContent(1);
+        return;
+      }
+      if (keybindings.matches(data, "tui.select.pageUp") || matchesKey(data, "left")) {
+        this.scrollContent(-Math.max(1, this.contentPageSize - 1));
+        return;
+      }
+      if (keybindings.matches(data, "tui.select.pageDown") || matchesKey(data, "right")) {
+        this.scrollContent(Math.max(1, this.contentPageSize - 1));
+        return;
+      }
+      if (matchesKey(data, "home")) {
+        this.contentOffset = 0;
+        return;
+      }
+      if (matchesKey(data, "end")) {
+        this.contentOffset = Math.max(0, this.contentLineCount - this.contentPageSize);
+        return;
+      }
+      if (keybindings.matches(data, "tui.select.cancel")) this.list.handleInput(data);
+      return;
+    }
+    if (keybindings.matches(data, "tui.select.pageUp") || matchesKey(data, "left")) {
+      this.scrollContent(-Math.max(1, this.contentPageSize - 1));
+      return;
+    }
+    if (keybindings.matches(data, "tui.select.pageDown") || matchesKey(data, "right")) {
+      this.scrollContent(Math.max(1, this.contentPageSize - 1));
+      return;
+    }
+    if (keybindings.matches(data, "tui.editor.deleteToLineStart")) {
+      this.updateFilter("");
+      return;
+    }
+    if (keybindings.matches(data, "tui.editor.deleteCharBackward")) {
+      this.updateFilter(removeLastGrapheme(this.filter));
+      return;
+    }
+
+    const printable = decodeKittyPrintable(data)
+      ?? (data.length > 0 && !/[\u0000-\u001f\u007f-\u009f]/u.test(data) ? data : undefined);
+    if (printable !== undefined) {
+      this.updateFilter(this.filter + printable);
+      return;
+    }
+
+    this.list.handleInput(data);
+  }
+
+  private updateFilter(filter: string): void {
+    this.filter = filter;
+    this.list.setFilter(filter);
+    const selected = this.list.getSelectedItem();
+    if (selected) this.list.onSelectionChange?.(selected);
+    else this.setSelectionPreview(undefined);
+  }
+
+  private renderContentViewport(
+    totalLines: number,
+    maxLines: number,
+    width: number,
+    read: (start: number, count: number) => string[]
+  ): string[] {
+    this.contentLineCount = totalLines;
+    if (totalLines === 0 || maxLines <= 0) {
+      this.contentOffset = 0;
+      this.contentPageSize = 1;
+      return [];
+    }
+    if (totalLines <= maxLines) {
+      this.contentOffset = 0;
+      this.contentPageSize = totalLines;
+      return read(0, totalLines).map((line) => truncateToWidth(line, width, ""));
+    }
+
+    const bodyLines = Math.max(1, maxLines - 1);
+    this.contentPageSize = bodyLines;
+    this.contentOffset = Math.max(0, Math.min(
+      this.contentOffset,
+      totalLines - bodyLines
+    ));
+    const end = Math.min(totalLines, this.contentOffset + bodyLines);
+    const above = this.contentOffset;
+    const below = totalLines - end;
+    const position = [
+      `${this.contentLabel} ${this.contentOffset + 1}–${end} of ${totalLines}`,
+      above > 0 ? `↑ ${above}` : undefined,
+      below > 0 ? `↓ ${below}` : undefined,
+      "←/→ or PgUp/PgDn scroll"
+    ].filter((value): value is string => Boolean(value)).join(" · ");
+    return [
+      ...read(this.contentOffset, end - this.contentOffset)
+        .map((line) => truncateToWidth(line, width, "")),
+      truncateToWidth(this.theme.muted(position), width, "")
+    ];
+  }
+
+  private scrollContent(delta: number): void {
+    const maximum = Math.max(0, this.contentLineCount - this.contentPageSize);
+    this.contentOffset = Math.max(0, Math.min(maximum, this.contentOffset + delta));
+  }
+
+  invalidate(): void {
+    this.list.invalidate();
+    this.content?.invalidate?.();
+    this.selectionPreview?.invalidate?.();
+  }
+}
+
+export function choose(
+  ui: TUI,
+  host: Container,
+  theme: ZCodeTheme,
+  options: {
+    title: string;
+    prompt: string;
+    help?: string;
+    items: ChoiceItem[];
+    content?: Component;
+    contentLabel?: string;
+    selectedIndex?: number;
+    signal?: AbortSignal;
+    showSelectedItemDetails?: boolean;
+  }
+): Promise<ChoiceItem | null> {
+  if (options.items.length === 0) return Promise.resolve(null);
+
+  return new Promise((resolve) => {
+    const choicesByValue = new Map<string, ChoiceItem>();
+    const detailsByValue = new Map<string, Component>();
+    const searchableItems = options.items.map((item, index): SelectItem => {
+      const safeItem: ChoiceItem = {
+        ...item,
+        label: sanitizeTerminalText(item.label, { preserveSgr: false }),
+        description: item.description
+          ? sanitizeTerminalText(item.description, { preserveSgr: false })
+          : undefined
+      };
+      const value = `${safeItem.label}\u0000${index}`;
+      choicesByValue.set(value, safeItem);
+      if (options.showSelectedItemDetails) {
+        detailsByValue.set(value, new ChoiceItemDetails(safeItem, theme));
+      }
+      return { value, label: safeItem.label, description: safeItem.description };
+    });
+    const hasDetails = Boolean(
+      options.content
+      || options.showSelectedItemDetails
+      || options.items.some((item) => item.preview)
+    );
+    const geometry = (): DialogGeometry => dialogGeometry(
+      ui.terminal.rows,
+      searchableItems.length,
+      hasDetails
+    );
+    const list = new ChoiceList(searchableItems, geometry().maxVisible, theme.select);
+    list.setSelectedIndex(options.selectedIndex ?? 0);
+    const dialog = new ChoiceDialog(
+      sanitizeTerminalText(options.title, { preserveSgr: false }),
+      sanitizeTerminalText(options.prompt, { preserveSgr: false }),
+      sanitizeTerminalText(
+        options.help ?? (hasDetails
+          ? "Type to filter · Up/Down choose · Ctrl+O details · ←/→ or PgUp/PgDn scroll · Enter confirm · Esc cancel"
+          : "Type to filter · Up/Down choose · Enter confirm · Esc cancel · Ctrl+U clear"),
+        { preserveSgr: false }
+      ),
+      list,
+      theme,
+      geometry,
+      options.content,
+      sanitizeTerminalText(options.contentLabel ?? "Details", { preserveSgr: false })
+    );
+    const previewFor = (item: SelectItem | null): Component | undefined => {
+      if (!item) return undefined;
+      return options.showSelectedItemDetails
+        ? detailsByValue.get(item.value)
+        : choicesByValue.get(item.value)?.preview;
+    };
+    dialog.setSelectionPreview(previewFor(list.getSelectedItem()));
+    let settled = false;
+    const finish = (item: ChoiceItem | null) => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener("abort", onAbort);
+      host.removeChild(dialog);
+      ui.requestRender();
+      resolve(item);
+    };
+    const onAbort = () => finish(null);
+    list.onSelect = (item) => finish(choicesByValue.get(item.value) ?? null);
+    list.onSelectionChange = (item) => dialog.setSelectionPreview(previewFor(item));
+    list.onCancel = () => finish(null);
+    host.addChild(dialog);
+    ui.setFocus(dialog);
+    ui.requestRender();
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) finish(null);
+  });
+}
+
+class TextPromptDialog implements Component {
+  constructor(
+    private readonly title: string,
+    private readonly prompt: string,
+    private readonly input: Component,
+    private readonly theme: ZCodeTheme,
+    private readonly help: string
+  ) {}
+
+  render(width: number): string[] {
+    const safeWidth = Math.max(1, width);
+    return [
+      ...wrapTerminalText(this.theme.bold(this.title), safeWidth),
+      ...wrapTerminalText(this.theme.muted(this.prompt), safeWidth),
+      "",
+      ...this.input.render(safeWidth),
+      "",
+      ...wrapTerminalText(this.theme.muted(this.help), safeWidth)
+    ];
+  }
+
+  invalidate(): void {
+    this.input.invalidate();
+  }
+}
+
+/**
+ * One asterisk per user-perceived character, padded back to the value's code unit
+ * length: masking by length alone renders extra asterisks for emoji and combining
+ * sequences, while a shorter mask makes Input.setValue() clamp the cursor into the
+ * middle of a grapheme and corrupt the next keystroke.
+ */
+function maskedValue(value: string): string {
+  // Printable ASCII always maps one code unit per grapheme; the fallback below
+  // re-segments the remainder on each step.
+  if (!/[^\x20-\x7e]/u.test(value)) return "*".repeat(value.length);
+  let remaining = value;
+  let graphemes = 0;
+  while (remaining) {
+    remaining = removeLastGrapheme(remaining);
+    graphemes += 1;
+  }
+  return `${"*".repeat(graphemes)}${" ".repeat(value.length - graphemes)}`;
+}
+
+class PromptInput extends Input {
+  constructor(
+    private readonly mask: boolean,
+    private readonly placeholder: string | undefined,
+    private readonly theme: ZCodeTheme
+  ) {
+    super();
+  }
+
+  override render(width: number): string[] {
+    const value = this.getValue();
+    if (this.mask && value) {
+      this.setValue(maskedValue(value));
+      try {
+        return super.render(width);
+      } finally {
+        this.setValue(value);
+      }
+    }
+
+    const lines = super.render(width);
+    if (!value && this.placeholder && lines[0]) {
+      const placeholder = this.theme.muted(this.placeholder);
+      const line = lines[0].replace("\x1b[7m \x1b[27m", `\x1b[7m \x1b[27m${placeholder}`);
+      return [truncateToWidth(line, width, "", true)];
+    }
+    return lines;
+  }
+}
+
+class PromptEditor extends Editor {
+  onEscape?: () => void;
+
+  constructor(
+    ui: TUI,
+    private readonly placeholder: string | undefined,
+    private readonly promptTheme: ZCodeTheme
+  ) {
+    super(ui, promptTheme.editor, { paddingX: 1 });
+  }
+
+  override handleInput(data: string): void {
+    if (getKeybindings().matches(data, "tui.select.cancel")) {
+      this.onEscape?.();
+      return;
+    }
+    super.handleInput(data);
+  }
+
+  override render(width: number): string[] {
+    const lines = super.render(width);
+    if (this.getText() || !this.placeholder) return lines;
+
+    const cursor = "\x1b[7m \x1b[0m";
+    const cursorLine = lines.findIndex((line) => line.includes(cursor));
+    if (cursorLine >= 0) {
+      lines[cursorLine] = truncateToWidth(
+        lines[cursorLine]!.replace(cursor, `${cursor}${this.promptTheme.muted(this.placeholder)}`),
+        width,
+        "",
+        true
+      );
+    }
+    return lines;
+  }
+}
+
+export function promptText(
+  ui: TUI,
+  host: Container,
+  theme: ZCodeTheme,
+  options: {
+    title: string;
+    prompt: string;
+    initialValue?: string;
+    help?: string;
+    signal?: AbortSignal;
+    mask?: boolean;
+    placeholder?: string;
+  }
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    const placeholder = options.placeholder
+      ? sanitizeTerminalText(options.placeholder, { preserveSgr: false })
+      : undefined;
+    const input = options.mask === true
+      ? new PromptInput(true, placeholder, theme)
+      : new PromptEditor(ui, placeholder, theme);
+    if (options.initialValue) {
+      if (input instanceof PromptEditor) input.setText(options.initialValue);
+      else input.setValue(options.initialValue);
+    }
+    const dialog = new TextPromptDialog(
+      sanitizeTerminalText(options.title, { preserveSgr: false }),
+      sanitizeTerminalText(options.prompt, { preserveSgr: false }),
+      input,
+      theme,
+      sanitizeTerminalText(options.help ?? "Enter confirm · Esc cancel", { preserveSgr: false })
+    );
+    let settled = false;
+    const finish = (value: string | null): void => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener("abort", onAbort);
+      host.removeChild(dialog);
+      ui.requestRender();
+      resolve(value);
+    };
+    const onAbort = () => finish(null);
+    input.onSubmit = (value) => finish(value);
+    input.onEscape = () => finish(null);
+    host.addChild(dialog);
+    ui.setFocus(input);
+    ui.requestRender();
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) finish(null);
+  });
+}

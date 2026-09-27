@@ -1,0 +1,7 @@
+{
+  "adapterSource": "deephik-progo/integrations/zcode-desktop-adapter",
+  "adapterRepositoryCommit": "0b12772689bb6289e3405f241e57cf0f148d7d9a",
+  "adapterSnapshot": "current working files",
+  "remoteClientRepository": "https://github.com/valeriikot/zcode-cli.git",
+  "remoteClientCommit": "dd001952e2bac15c28d370f204c33f7d96d0d3ef"
+}

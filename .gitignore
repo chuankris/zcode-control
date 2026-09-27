@@ -1,0 +1,11 @@
+# Local dependencies and private connection state
+node_modules/
+.private/
+zcode-private/
+adapter-state/
+.env
+.env.*
+!.env.example
+remote-url.txt
+adapter.json
+*.log
