@@ -1,0 +1,73 @@
+{
+  "formatVersion": 1,
+  "verifiedOn": "2026-09-21",
+  "branch": "main",
+  "plugin": {
+    "package": "@zaimokuza/dsh-acp-adapter",
+    "version": "0.1.5-rc.2.5",
+    "modified": false
+  },
+  "adapter": {
+    "entry": "integrations/zcode-desktop-adapter/adapter.mjs",
+    "workbenchProtocol": "ACP over stdio",
+    "downstreamProtocol": "ZCode desktop Remote Control V4",
+    "remoteClientCommit": "dd001952e2bac15c28d370f204c33f7d96d0d3ef",
+    "dependencyInstallation": "An external checkout is supplied through remoteClientRoot; transport code is not copied into the workbench.",
+    "desktopVersion": "3.14.0",
+    "outputSource": "official V4 conversation subscription (subscribeConversationV4/resyncConversationV4/unsubscribeConversationV4 + onDynamicConversationFrame workspace frame stream); zcode-task/getTaskSnapshot intentionally unused for turn output (stale in-memory projection on desktop 3.14.0 — live evidence in zcode-lab/.private/remote-site-onboarding/)",
+    "adapterVersion": "0.3.1"
+  },
+  "configuration": {
+    "agentId": "zcode-desktop",
+    "displayName": "本机 Zcode · 桌面可见",
+    "routeId": "acp-zcode-desktop",
+    "existingBackgroundAgentId": "zcode-local",
+    "settingsContainCredentials": false,
+    "privateFiles": "Connection URL, adapter configuration and session bindings live outside the repository.",
+    "workspaceSelection": "Exact configured workspace on the paired desktop; no default-workspace fallback."
+  },
+  "remoteSiteNode": {
+    "design": "workspaceSelection \"session\": one workbench node (e.g. 现场Zcode · PC1-HZ20035172) serves every workspace the site reports — read-only discovery at session/new returns them as one ACP config option, the user picks per session through the agent control menu (session/set_config_option), and dispatch bridges exactly that workspace with no default, no fallback, and immutability after the first dispatch.",
+    "connectionUrlFile": "zcode-lab/.private/remote-site-probe-url.txt (outside the repository; contents never echoed)",
+    "healthCheck": "settings-page recheck performs the live discovery (offline sites surface the adapter's explicit error); --health prints a fixed-string online/offline line with desktop version and workspace count; the ACP card protocol has no metadata slot, so in-session facts ride the workspace option description — recorded UI boundary.",
+    "validation": {
+      "status": "offline_suite_passed_first_live_run_root_cause_fixed",
+      "offlineTests": "node --test integrations/zcode-desktop-adapter/test/adapter.test.mjs — 51/51 green (16 remote-site tests: discovery, selection pinning via createSession workspace id, scope isolation, credential scrubbing, --health, legacy fixed-config compatibility, controller-slot concurrency: session/new busy during a live turn, full final answer under a concurrent probe, prompt serialization behind an open discovery)",
+      "localNodesUnaffected": "existing zcode-local / zcode-loopback / zcode-desktop settings untouched; fixed-mode adapter behavior unchanged",
+      "liveUiAcceptance": "first run on DSH 0.1.5-rc.2.5: node registered, session/new listed 19 workspaces, prompt-before-selection refused, dispatched read-only turn completedSuccess on the desktop — but the workbench stream died mid-answer with outcome-unknown because a concurrent session/new discovery paired over the live controller (the relay grants one controller per device); fixed by the busy answer plus in-process single-slot serialization, one further live turn pending"
+    }
+  },
+  "validation": {
+    "status": "workbench_live_v4_passed",
+    "delegatedImplementation": "ZCode native desktop task, supervised and reviewed by Codex",
+    "directDesktopCreateAndResume": "passed_before_workbench_integration",
+    "workbenchNodeHealth": "passed_protocol_probe",
+    "workbenchFirstTurn": "passed_real_desktop_bash_output_main",
+    "sameSessionSecondTurn": "passed_two_consecutive_turns_after_completion_projection_fix",
+    "nativeDesktopVisibility": "registration_confirmed_through_desktop_facade; visual_acceptance_blocked_by_Windows_GetCursorPos_access_denied",
+    "adapterRestartResume": "passed_original_binding_restored",
+    "focusedTests": "35_adapter_passed_0_failed_plus_59_ui_conversation_passed_0_failed_independent_codex_run",
+    "desktopTaskRegistration": "same_accepted_task_id_verified_and_registered_without_new_input",
+    "regressionsFixed": [
+      "Release remote controller connection between turns and idle loads.",
+      "Require new assistant content before completed status can end a turn.",
+      "Serialize every relay controller pairing through one in-process slot; session-mode session/new answers busy during a live turn (a concurrent discovery pairing kicked the streaming controller — live 0.1.5-rc.2.5 evidence)."
+    ],
+    "workbenchReloadHistory": "passed_both_consecutive_turn_responses_preserved",
+    "documentationChecks": {
+      "command": "pnpm run doc-sync",
+      "passed": 33,
+      "failed": 1,
+      "failure": "documentation site checks: Windows EPERM creating a fixture symlink in scripts/project-doc-site.spec.ts:160; 68 of 69 site tests passed",
+      "translationPairing": "passed"
+    },
+    "offlineTests": "node --test integrations/zcode-desktop-adapter/test/adapter.test.mjs — 35/35 green (V4 frame scripts; fake refuses getTaskSnapshot and requires resync base)",
+    "workbenchLiveV4Acceptance": "passed_progress_plus_bash_tool_plus_terminal_marker_in_34_seconds"
+  },
+  "limitations": [
+    "Desktop-visible execution uses the official internet relay, including for a local workspace.",
+    "Desktop approvals remain in ZCode; this integration does not auto-approve them.",
+    "Background and desktop nodes retain independent task bindings; cross-channel adoption of a running task is not accepted.",
+    "A real remote site has had one live run (discovery, selection, one desktop-completed turn); concurrent control of one desktop by an external controller remains unaccepted."
+  ]
+}

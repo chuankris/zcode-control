@@ -14,6 +14,13 @@
 // onDynamicConversationFrame workspace frame stream, and
 // zcode-task/createTask for native task-list registration).
 //
+// Continuation of an existing desktop task goes through `session/adopt`:
+// the task id is verified against the official zcode-task/listTasks index
+// and the live conversation snapshot (terminal phase, no pending
+// interaction) before a recoverable binding is created or reused; later
+// prompts then ride the existing sendText/startNow path and never
+// createSession/createTask.
+//
 // Output source: turn output is projected ONLY from the official V4
 // conversation subscription (snapshot wholesale-replace + contiguous
 // (fromSeq,toSeq] delta intervals), matching the official web client's
@@ -67,16 +74,23 @@
 // fixed-string summary — online/offline, desktop version, workspace count —
 // without ever printing connection credentials.
 //
-// Exit codes: 0 clean shutdown · 1 health check found the site offline
+// `--reconcile-dispatch <taskId> [<workspacePath>] [--confirm human-verified]
+// [--operator <label>]` gathers the read-only desktop evidence for one
+// unresolved dispatch ledger entry and, only under the explicit human
+// attestation, writes it off (see the mode's own section below). The expected
+// prompt text rides stdin as one JSON line, never argv.
+//
+// Exit codes: 0 clean shutdown · 1 health offline, task listing failed, or a
+//             reconcile pass refused (nothing was written off)
 //             2 bad configuration · 7 protocol frame limit
 //             8 remote-client load failure
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
-const VERSION = "0.3.2";
+const VERSION = "0.5.0";
 const ADAPTER_NAME = "zcode-desktop-adapter";
 const HOST_INSTRUCTIONS_PREFIX = "Current host instructions (replace earlier host instructions for this request).";
 const MAX_LINE_CHARS = 16 * 1024 * 1024; // one ACP message, inbound
@@ -127,6 +141,55 @@ if (configArgIdx === -1) fail(2, "launch with --config <private-json>");
 const configPath = process.argv[configArgIdx + 1];
 if (!configPath || configPath.startsWith("-")) fail(2, "--config requires a file path argument");
 const healthMode = process.argv.includes("--health");
+// `--list-tasks [<workspacePath>]`: one read-only desktop task-index listing.
+// The path is validated after configuration parsing (session mode requires it;
+// fixed mode refuses it because the pin already lives in the configuration).
+const listTasksArgIdx = process.argv.indexOf("--list-tasks");
+const listTasksMode = listTasksArgIdx !== -1;
+let listTasksWorkspace = null;
+if (listTasksMode) {
+  const candidate = process.argv[listTasksArgIdx + 1];
+  if (candidate !== undefined && !candidate.startsWith("-")) listTasksWorkspace = candidate;
+}
+// `--reconcile-dispatch <taskId> [<workspacePath>] [--confirm human-verified]
+// [--operator <label>]`: verify-then-release one unresolved dispatch ledger
+// entry (see the mode block below the --list-tasks section). The expected
+// prompt text arrives on stdin as one JSON line, never on the command line.
+const reconcileArgIdx = process.argv.indexOf("--reconcile-dispatch");
+const reconcileMode = reconcileArgIdx !== -1;
+let reconcileTaskId = null;
+let reconcileWorkspace = null;
+let reconcileConfirm = false;
+let reconcileOperator = null;
+if (reconcileMode) {
+  const operands = [];
+  for (let index = reconcileArgIdx + 1; index < process.argv.length; index += 1) {
+    const arg = process.argv[index];
+    if (arg === "--confirm") {
+      if (process.argv[index + 1] !== "human-verified") fail(2, "--confirm requires the explicit attestation value human-verified");
+      reconcileConfirm = true;
+      index += 1;
+      continue;
+    }
+    if (arg === "--operator") {
+      const label = process.argv[index + 1];
+      if (typeof label !== "string" || label.length === 0 || label.length > 120 || /[\r\n\0]/.test(label)) {
+        fail(2, "--operator requires a label of 1..120 characters without line breaks");
+      }
+      reconcileOperator = label;
+      index += 1;
+      continue;
+    }
+    operands.push(arg);
+  }
+  if (operands.length < 1 || operands.length > 2 || operands.some((operand) => operand.startsWith("-"))) {
+    fail(2, "--reconcile-dispatch takes a taskId and an optional workspace path");
+  }
+  reconcileTaskId = operands[0];
+  reconcileWorkspace = operands[1] ?? null;
+}
+if (healthMode && listTasksMode) fail(2, "--health and --list-tasks are exclusive");
+if ((healthMode || listTasksMode) && reconcileMode) fail(2, "--reconcile-dispatch is exclusive with --health and --list-tasks");
 let configRaw;
 try {
   configRaw = readFileSync(configPath, "utf8");
@@ -150,6 +213,23 @@ if (workspaceSelection !== "fixed" && workspaceSelection !== "session") {
   fail(2, 'configuration workspaceSelection must be "fixed" or "session"');
 }
 const SESSION_WORKSPACES = workspaceSelection === "session";
+if (listTasksMode && SESSION_WORKSPACES && listTasksWorkspace === null) {
+  fail(2, "--list-tasks requires a workspace path when workspaceSelection is session");
+}
+if (listTasksMode && !SESSION_WORKSPACES && listTasksWorkspace !== null) {
+  fail(2, "--list-tasks takes no workspace path; the workspace is pinned in this configuration");
+}
+if (reconcileMode) {
+  if (typeof reconcileTaskId !== "string" || reconcileTaskId.length === 0 || reconcileTaskId.length > 200) {
+    fail(2, "--reconcile-dispatch requires a taskId of 1..200 characters");
+  }
+  if (SESSION_WORKSPACES && reconcileWorkspace === null) {
+    fail(2, "--reconcile-dispatch requires a workspace path when workspaceSelection is session");
+  }
+  if (!SESSION_WORKSPACES && reconcileWorkspace !== null) {
+    fail(2, "--reconcile-dispatch takes no workspace path; the workspace is pinned in this configuration");
+  }
+}
 if (SESSION_WORKSPACES && configFile.workspace !== undefined && configFile.workspace !== null) {
   fail(2, 'configuration workspace must be omitted when workspaceSelection is "session" (the workspace is chosen per session)');
 }
@@ -672,9 +752,9 @@ function writeBinding(binding) {
   renameSync(temporary, file);
 }
 
-function newBinding(cwd) {
+function assembleBinding(cwd) {
   const dshSessionId = `zdsk-${randomUUID()}`;
-  const binding = {
+  return {
     v: 1,
     adapter: ADAPTER_NAME,
     dshSessionId,
@@ -687,6 +767,10 @@ function newBinding(cwd) {
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
+}
+
+function newBinding(cwd) {
+  const binding = assembleBinding(cwd);
   writeBinding(binding);
   return binding;
 }
@@ -723,6 +807,110 @@ function refreshBindingScope(binding) {
   binding.workspace = link.workspace === undefined ? null : { ...link.workspace };
 }
 
+/**
+ * The in-scope binding that already owns one desktop task id, when any.
+ * Session-mode bindings for other workspaces are excluded by the caller's
+ * scope check so one desktop task never maps to two bindings on this node.
+ */
+function findBindingByDesktopTask(taskId) {
+  for (const binding of listScopedBindings()) {
+    if (binding.desktopSessionId === taskId) return binding;
+  }
+  return undefined;
+}
+
+/**
+ * `session/adopt`: binds one existing desktop task so later prompts continue
+ * it through sendText/startNow instead of creating a replacement task.
+ * Verification is fail-closed on two independent desktop sources —
+ *   1. the official `zcode-task/listTasks` index of the bridged workspace
+ *      must carry the task id with status "completed";
+ *   2. the live conversation snapshot must be terminal with no pending
+ *      interaction.
+ * A binding that already owns this desktop task (this connection, this
+ * workspace) is reused verbatim — never a second binding. Any mismatch,
+ * uncertain state, or unconfirmed previous dispatch refuses; this method
+ * never creates a desktop session, never registers one, and never re-sends.
+ */
+async function handleAdoptSession(params) {
+  if (turnInFlight !== null) {
+    throw new RpcError(ERR_BUSY, "a prompt turn is in flight; task adoption is unavailable until it ends");
+  }
+  const taskId = params?.taskId;
+  if (typeof taskId !== "string" || taskId.length === 0 || taskId.length > 200) {
+    throw new RpcError(-32602, "session/adopt requires a taskId string of 1..200 characters");
+  }
+  const requestedWorkspace = params?.workspacePath;
+  if (SESSION_WORKSPACES) {
+    if (typeof requestedWorkspace !== "string" || requestedWorkspace.length === 0) {
+      throw new RpcError(-32602, "session/adopt requires the workspacePath the desktop task belongs to");
+    }
+  } else if (requestedWorkspace !== undefined && requestedWorkspace !== null) {
+    throw new RpcError(-32602, "session/adopt takes no workspace path; the workspace is pinned in this configuration");
+  }
+  const targetNorm = SESSION_WORKSPACES ? normalizeWorkspacePath(requestedWorkspace) : WORKSPACE_NORM;
+  const existing = findBindingByDesktopTask(taskId);
+  if (existing !== undefined) {
+    const scopeWorkspace = SESSION_WORKSPACES ? existing.scope.workspace : WORKSPACE_NORM;
+    if (scopeWorkspace !== targetNorm) {
+      throw new RpcError(ERR_SESSION_STATE, "the desktop task is already bound to another workspace on this site; continue it from its own workspace");
+    }
+    if (existing.dispatch !== null && existing.dispatch !== undefined) {
+      throw new RpcError(ERR_SESSION_STATE, "the previous desktop command's outcome is unknown (adapter restart or lost ack); verify the task in the Zcode desktop before sending more prompts");
+    }
+  }
+  await link.ensure(SESSION_WORKSPACES ? targetNorm : undefined).catch((error) => {
+    throw new RpcError(ERR_LINK, error instanceof LinkError ? error.message : "desktop link failed");
+  });
+  await link.conversationEnsure().catch(() => {
+    throw new RpcError(ERR_LINK, "the desktop conversation handshake failed");
+  });
+  let metas;
+  try {
+    metas = await link.bridge.call("zcode-task", "listTasks", [link.workspaceTarget()]);
+  } catch {
+    throw new RpcError(ERR_LINK, "the desktop task index could not be read; the task cannot be verified for continuation");
+  }
+  const meta = Array.isArray(metas)
+    ? metas.find((entry) => typeof entry === "object" && entry !== null && entry.taskId === taskId)
+    : undefined;
+  if (meta === undefined) {
+    throw new RpcError(ERR_SESSION_STATE, "the desktop task is not in this workspace's synced task index (it may be pinned, archived, or belong to another workspace); continuation is refused");
+  }
+  if (meta.status !== "completed") {
+    const status = meta.status === "running" || meta.status === "error" ? meta.status : "unknown";
+    throw new RpcError(ERR_SESSION_STATE, `the desktop task is not completed (${status}); finish or verify it in the Zcode desktop first`);
+  }
+  const stream = new ConversationStream(taskId);
+  try {
+    await stream.attach().catch((error) => {
+      throw new RpcError(ERR_LINK, error instanceof LinkError ? error.message : "desktop conversation subscription failed");
+    });
+    await stream.waitForSnapshot(config.requestTimeoutMs).catch(() => {
+      throw new RpcError(ERR_LINK, "the desktop task state could not be read for continuation (no initial conversation snapshot)");
+    });
+    if (!TERMINAL_PHASES.has(stream.projection.phase) || stream.projection.pendingInteractions.length > 0) {
+      throw new RpcError(ERR_SESSION_STATE, "the desktop task's live conversation is still running or awaiting input; continuation is refused");
+    }
+  } finally {
+    await stream.dispose();
+  }
+  if (existing !== undefined) {
+    refreshBindingScope(existing);
+    writeBinding(existing);
+    return { sessionId: existing.dshSessionId, created: false };
+  }
+  const binding = assembleBinding(undefined);
+  binding.desktopSessionId = taskId;
+  binding.scope.workspace = targetNorm;
+  binding.workspace = { ...link.workspace };
+  // The desktop registered this task itself when it was created; registerDesktopTask
+  // must never submit it to zcode-task/createTask.
+  binding.registration = "adopted";
+  writeBinding(binding);
+  return { sessionId: binding.dshSessionId, created: true };
+}
+
 /** Register the existing session with the desktop task facade. It initializes
  * project-list placement and emits task_created; a raw agent createSession
  * alone does not establish those desktop subscriptions. Never submit input here.
@@ -730,7 +918,7 @@ function refreshBindingScope(binding) {
  * zcode-task snapshot read is deliberately not consulted.
  */
 async function registerDesktopTask(binding) {
-  if (binding.registration === "registered") return;
+  if (binding.registration === "registered" || binding.registration === "adopted") return;
   if (binding.registration === "pending" || binding.registration === "unknown") {
     throw new RpcError(ERR_SESSION_STATE, "desktop task registration is unconfirmed; inspect the existing native task before retrying");
   }
@@ -783,6 +971,51 @@ const TOOL_KIND_BY_NAME = new Map([
   ["Bash", "execute"], ["Execute", "execute"], ["WebFetch", "fetch"], ["WebSearch", "fetch"],
   ["Task", "other"], ["Think", "think"],
 ]);
+
+// ---------- conversation command acknowledgement (proven V4 contract) ----------
+//
+// commandAckSchema (ZCode-official 3.14.0 packages/shared/src/zcode-protocol-v4/
+// command.ts; the installed 3.14.3 desktop bundle enforces the same set through
+// assertV4CommandAckOk) resolves every conversation command with
+// { commandId, status, reasonCode?, message?, revisionAtDecision, result? } where
+// status is exactly one of accepted/rejected/stale/duplicate/noop/failed. On the
+// remote channel the ack is observed in two positions: flat on the RPC reply
+// (live 2026-09-21 createSession dispatch) and nested under `ack` like the other
+// conversation RPC results (subscribeConversationV4, live 2026-09-28).
+// Recognition requires exactly one of those positions to carry a known status
+// and, when the ack names a command id, that id to be this command's; every
+// other shape stays unrecognized and fails closed.
+
+const COMMAND_ACK_STATUSES = new Set(["accepted", "rejected", "stale", "duplicate", "noop", "failed"]);
+/** Officially processed-OK statuses (assertV4CommandAckOk): the command was handled. */
+const COMMAND_ACK_OK_FOR_STOP = new Set(["accepted", "duplicate", "noop"]);
+
+function commandAckCandidate(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) &&
+      COMMAND_ACK_STATUSES.has(value.status)
+    ? value
+    : undefined;
+}
+
+/**
+ * Interprets one sendConversationCommandV4 reply against the proven contract.
+ * @param {unknown} reply - the raw RPC reply.
+ * @param {string} commandId - the dispatched envelope's command id.
+ * @returns {{ ack: object, status: string, detail: string } | undefined} undefined for every unrecognized shape.
+ */
+function interpretCommandAck(reply, commandId) {
+  const candidates = [commandAckCandidate(reply), commandAckCandidate(reply?.ack)]
+    .filter((candidate) => candidate !== undefined);
+  if (candidates.length !== 1) return undefined;
+  const ack = candidates[0];
+  if (typeof ack.commandId === "string" && ack.commandId !== commandId) return undefined;
+  const detail = [
+    `status ${String(ack.status)}`,
+    typeof ack.reasonCode === "string" && ack.reasonCode.length > 0 ? `reason ${ack.reasonCode}` : undefined,
+    typeof ack.message === "string" && ack.message.length > 0 ? `message ${scrub(ack.message.slice(0, 120))}` : undefined,
+  ].filter(Boolean).join(", ");
+  return { ack, status: ack.status, detail };
+}
 
 function decodeBase64(value) {
   return Buffer.from(value, "base64");
@@ -1284,15 +1517,35 @@ async function runTurn(turn, binding, stream, baseline) {
   );
   const toolCards = new Map(baseline.toolCards);
   const deadline = Date.now() + config.turnTimeoutMs;
+  // Tail settle: a real desktop can deliver the reply's final full-text row
+  // just behind the terminal patch (observed live 2026-09-28: the turn ended
+  // on the first terminal observation and the trailing row never streamed —
+  // the DSH transcript held "CONT" while the desktop's own snapshot held the
+  // full answer). Once THIS turn's live phase transition into a terminal
+  // state is observed with assistant evidence, the turn ends only after the
+  // projection holds still for `tailQuietMs` (every drained row restarts the
+  // window) or `tailSettleCapMs` elapses. Never a resend, never unbounded:
+  // a stream that never quiets is released at the cap with the best-effort
+  // tail, and a turn whose budget expires after the terminal transition
+  // still ends successfully — only the tail was cut, not the outcome.
+  const tailQuietMs = Math.max(250, Math.min(config.pollIntervalMs, 1000));
+  const tailSettleCapMs = Math.max(tailQuietMs + 250, Math.min(config.requestTimeoutMs, 5000));
   let newAssistant = false;
+  let terminalTransitionAt; // first live non-terminal → terminal phase move of this turn
+  let lastPhase = stream.projection.phase;
+  let lastChangeAt = Date.now(); // last instant the live projection changed
   let cancelDeadline;
   let approvalVisible = false;
   let observedGeneration = link.frameGeneration;
   for (;;) {
     if (Date.now() >= (cancelDeadline ?? deadline)) {
-      throw new TurnError(turn.cancelRequested
-        ? "the desktop stop could not be verified before the deadline; the remote task state is unknown"
-        : "the turn deadline expired; the desktop task may still be running — check the Zcode desktop");
+      if (turn.cancelRequested) {
+        throw new TurnError("the desktop stop could not be verified before the deadline; the remote task state is unknown");
+      }
+      if (terminalTransitionAt !== undefined && newAssistant) {
+        return { stopReason: "end_turn" };
+      }
+      throw new TurnError("the turn deadline expired; the desktop task may still be running — check the Zcode desktop");
     }
     if (link.relayDead()) throw new TurnError("the relay link to the desktop was lost; the remote task state is unknown");
     if (link.frameGeneration !== observedGeneration) {
@@ -1312,7 +1565,9 @@ async function runTurn(turn, binding, stream, baseline) {
       if (!turn.stopAccepted) throw new TurnError("the desktop did not confirm the stop command; the remote task state is unknown");
     }
     await stream.waitNext(config.pollIntervalMs);
-    for (const row of stream.drainChangedRows()) {
+    const changedRows = stream.drainChangedRows();
+    if (changedRows.length > 0) lastChangeAt = Date.now();
+    for (const row of changedRows) {
       const text = rowText(row);
       if (text !== null) {
         const previous = emittedText.get(row.rowId);
@@ -1355,11 +1610,29 @@ async function runTurn(turn, binding, stream, baseline) {
       approvalVisible = awaitingApproval;
     }
     const phase = stream.projection.phase;
+    if (phase !== lastPhase) {
+      lastPhase = phase;
+      lastChangeAt = Date.now();
+      if (TERMINAL_PHASES.has(phase)) terminalTransitionAt = Date.now();
+    }
     if (TERMINAL_PHASES.has(phase)) {
       if (phase === "completedSuccess") {
-        // New user text alone is not completion: the phase can settle before the
-        // assistant rows project. Wait for this turn's visible answer too.
-        if (newAssistant) return { stopReason: "end_turn" };
+        // New user text alone is not completion: the phase can settle before
+        // the assistant rows project. Wait for this turn's visible answer too.
+        if (newAssistant) {
+          if (terminalTransitionAt === undefined) {
+            // The phase was already terminal before this turn's frames (a
+            // continuation's baseline snapshot) and never moved: there is no
+            // live terminal to settle behind, so keep the historical end.
+            return { stopReason: "end_turn" };
+          }
+          // Tail settle (see tailQuietMs above): hold the subscription open
+          // for the trailing full-text row until the projection quiets or the
+          // cap elapses; every drained row restarts the quiet window.
+          if (Date.now() - lastChangeAt >= tailQuietMs || Date.now() - terminalTransitionAt >= tailSettleCapMs) {
+            return { stopReason: "end_turn" };
+          }
+        }
       } else if (turn.cancelRequested && turn.stopAccepted) {
         return { stopReason: "cancelled" };
       } else {
@@ -1390,16 +1663,18 @@ async function settleStop(turn) {
     turn.stopAccepted = false;
     return;
   }
+  const commandId = randomUUID();
   try {
-    const ack = await link.sendCommand({
-      commandId: randomUUID(),
+    const reply = await link.sendCommand({
+      commandId,
       clientId: CLIENT_ID,
       sessionId: turn.desktopSessionId,
       type: "stop",
       payload: {},
       issuedAt: Date.now(),
     });
-    turn.stopAccepted = ack?.status === "accepted";
+    const acknowledged = interpretCommandAck(reply, commandId);
+    turn.stopAccepted = acknowledged !== undefined && COMMAND_ACK_OK_FOR_STOP.has(acknowledged.status);
   } catch {
     turn.stopAccepted = false;
   }
@@ -1734,9 +2009,9 @@ async function dispatchPrompt(turn, binding, params) {
         : { text: promptText, requestedDelivery: "startNow" },
     issuedAt: Date.now(),
   };
-  let ack;
+  let reply;
   try {
-    ack = await link.sendCommand(envelope);
+    reply = await link.sendCommand(envelope);
   } catch {
     // The dispatch record intentionally stays: the outcome is unknown.
     await stream.dispose();
@@ -1745,15 +2020,33 @@ async function dispatchPrompt(turn, binding, params) {
       "the desktop did not acknowledge the command and its outcome is unknown; check the task in the Zcode desktop before retrying",
     );
   }
-  if (ack?.status === "rejected") {
+  const acknowledged = interpretCommandAck(reply, commandId);
+  if (acknowledged === undefined) {
+    await stream.dispose();
+    throw new RpcError(ERR_TURN, "the desktop returned an unrecognized acknowledgement; the command outcome is unknown");
+  }
+  const { ack, status, detail } = acknowledged;
+  if (status === "rejected" || status === "stale") {
+    // Proven not-applied resolutions: a guard refused the command, or the CAS
+    // revision moved under it. The desktop never received this input, so the
+    // ledger clears and a fresh dispatch may retry under a new command id.
     binding.dispatch = null;
     writeBinding(binding);
     await stream.dispose();
-    throw new RpcError(ERR_TURN, `the desktop rejected the ${kind} command`);
+    throw new RpcError(ERR_TURN, `the desktop refused the ${kind} command (${detail})`);
   }
-  if (ack?.status !== "accepted") {
+  if (status === "noop") {
+    // A recognized no-op is neither delivery nor an unknown outcome: the
+    // desktop resolved the command without applying it now. Keep the ledger
+    // blocking until a human verifies the task.
     await stream.dispose();
-    throw new RpcError(ERR_TURN, "the desktop returned an unrecognized acknowledgement; the command outcome is unknown");
+    throw new RpcError(ERR_TURN, `the desktop resolved the ${kind} command as noop, not applied (${detail}); verify the task in the Zcode desktop before retrying`);
+  }
+  if (status !== "accepted" && status !== "duplicate") {
+    // "failed" resolves the command but does not prove whether the input was
+    // applied — fail closed with the ledger intact.
+    await stream.dispose();
+    throw new RpcError(ERR_TURN, `the desktop failed the ${kind} command (${detail}); the outcome is unknown — verify the task in the Zcode desktop`);
   }
   const ackSessionId = typeof ack?.result?.sessionId === "string" ? ack.result.sessionId : undefined;
   if (kind === "createSession") {
@@ -1819,6 +2112,439 @@ if (healthMode) {
   // Exit on a later tick: exiting synchronously while the module graph is
   // still unwinding a caught top-level exception trips libuv's Windows
   // async-handle teardown assertion.
+  setImmediate(() => process.exit(process.exitCode ?? 1));
+}
+
+// ---------- --list-tasks: one read-only desktop task-index listing ----------
+
+/** Upper bound on tasks one listing reports; the workbench asks per workspace. */
+const LIST_TASKS_ROW_CAP = 200;
+/** Title cap per row, applied after credential/URL scrubbing. */
+const LIST_TASKS_TITLE_CAP = 200;
+
+/**
+ * Projects desktop `ZCodeTaskMeta` rows into the fixed wire subset. Rows are
+ * validated (process boundary); unusable rows are skipped, never guessed.
+ * A task whose desktop id names a binding in this adapter's stateDir is marked
+ * `workbench` with the DSH-side session id so the workbench can join the two
+ * lists; everything else is `desktop`-origin.
+ */
+function projectDesktopTasks(metas, ownership) {
+  if (!Array.isArray(metas)) return [];
+  const rows = [];
+  for (const meta of metas) {
+    if (typeof meta !== "object" || meta === null) continue;
+    const taskId = typeof meta.taskId === "string" ? meta.taskId : "";
+    if (taskId.length === 0) continue;
+    const owned = ownership.get(taskId);
+    const created = typeof meta.createdAt === "number" && Number.isFinite(meta.createdAt)
+      ? new Date(meta.createdAt).toISOString()
+      : "";
+    const updated = typeof meta.updatedAt === "number" && Number.isFinite(meta.updatedAt)
+      ? new Date(meta.updatedAt).toISOString()
+      : "";
+    rows.push({
+      taskId,
+      title: typeof meta.title === "string" && meta.title.length > 0
+        ? scrub(meta.title).slice(0, LIST_TASKS_TITLE_CAP)
+        : "",
+      status: meta.status === "running" || meta.status === "completed" || meta.status === "error"
+        ? meta.status
+        : "unknown",
+      createdAt: created,
+      updatedAt: updated,
+      origin: owned === undefined ? "desktop" : "workbench",
+      ...(owned !== undefined ? { dshSessionId: owned } : {}),
+    });
+    if (rows.length >= LIST_TASKS_ROW_CAP) break;
+  }
+  rows.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
+  return rows;
+}
+
+/**
+ * Desktop ids this adapter owns for one workspace: bindings on the current
+ * connection identity whose selected (or configured) workspace is the listed
+ * one, keyed by desktop session id.
+ */
+function desktopTaskOwnership(targetNorm) {
+  const ownership = new Map();
+  for (const binding of listScopedBindings()) {
+    if (typeof binding.desktopSessionId !== "string" || binding.desktopSessionId.length === 0) continue;
+    const scopeWorkspace = SESSION_WORKSPACES ? binding.scope.workspace : WORKSPACE_NORM;
+    if (scopeWorkspace !== targetNorm) continue;
+    ownership.set(binding.desktopSessionId, binding.dshSessionId);
+  }
+  return ownership;
+}
+
+if (listTasksMode) {
+  try {
+    const params = readConnection();
+    // One controller pairing for the whole read-only listing, like discovery.
+    await acquireController();
+    const client = new RemoteClientCtor(params, { requestTimeoutMs: config.requestTimeoutMs });
+    let report;
+    try {
+      await client.connect({ pairingTimeoutMs: Math.max(60_000, config.requestTimeoutMs * 2) });
+      const boot = await client.bootstrap();
+      const discovery = discoveryFromBoot(boot);
+      if (discovery.entries.length === 0) throw new LinkError("the site registered no workspaces");
+      const target = pickFromEntries(discovery.entries, SESSION_WORKSPACES ? normalizeWorkspacePath(listTasksWorkspace) : WORKSPACE_NORM);
+      const bridge = await client.openBridge(target.identity ?? target.path);
+      const metas = await bridge.call("zcode-task", "listTasks", [{
+        workspacePath: target.path,
+        ...(target.identity !== null ? { workspaceIdentity: target.identity } : {}),
+      }]);
+      report = {
+        desktopVersion: discovery.appVersion,
+        tasks: projectDesktopTasks(metas, desktopTaskOwnership(normalizeWorkspacePath(target.path))),
+      };
+    } finally {
+      try {
+        client.dispose();
+      } catch {
+        /* teardown must stay silent and fixed-string */
+      }
+      releaseController();
+    }
+    process.stdout.write(`[${ADAPTER_NAME}] tasks: ${JSON.stringify(report)}\n`);
+    process.exitCode = 0;
+  } catch (error) {
+    process.stderr.write(`[${ADAPTER_NAME}] tasks: ${siteName} task listing failed (${error instanceof LinkError ? error.message : error instanceof Error ? scrub(error.message) : "unknown"})\n`);
+    process.exitCode = 1;
+  }
+  // Same deferred exit as --health: never unwind the module graph synchronously.
+  setImmediate(() => process.exit(process.exitCode ?? 1));
+}
+
+// ---------- --reconcile-dispatch: verify-then-release one unresolved dispatch ----------
+//
+// An unresolved `binding.dispatch` entry blocks all further prompts on that
+// binding until a human checks the desktop — but the desktop protocol cannot
+// prove non-application after the fact: the command id never reappears in the
+// conversation snapshot, and the snapshot is a row tail window. This mode
+// therefore gathers every read-only fact the desktop does expose (task-index
+// row, live conversation phase, pending interactions, and whether the old
+// follow-up text appears as a user turn) and refuses on any signal of
+// application or unreadable evidence. The ledger is cleared only when an
+// operator explicitly attests `--confirm human-verified`; the attestation, not
+// the protocol, carries the residual uncertainty (tail-window truncation,
+// post-dispatch task timestamps). It never re-sends the old command, never
+// creates a desktop task, and never touches a binding whose dispatch already
+// settled; each write-off is one append-only `reconcile-ledger.jsonl` entry.
+
+/** One-shot stdin budget for the expected-prompt JSON line (local I/O constant). */
+const RECONCILE_STDIN_BUDGET_MS = 5000;
+/** Mirrors the workbench prompt bound; longer stdin lines are not accepted. */
+const RECONCILE_PROMPT_CAP = 20_000;
+/** Inbound stdin cap before the reader gives up parsing more lines. */
+const RECONCILE_STDIN_CHAR_CAP = RECONCILE_PROMPT_CAP * 2 + 1024;
+
+/** The reconcile report's fixed marker prefix on stdout (one JSON line). */
+const RECONCILE_LINE_MARKER = "] reconcile: ";
+
+/**
+ * Reads the expected prompt text from stdin: one JSON line
+ * `{"expectedPromptText":"..."}`. Resolves on the first valid line, on stdin
+ * end, or after the local budget — null when no valid line arrived. The text
+ * never touches argv, stdout, or any persisted file.
+ * @returns {Promise<string | null>} the expected prompt text, or null.
+ */
+function readExpectedPromptText() {
+  return new Promise((resolve) => {
+    let buffer = "";
+    let text = null;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.stdin.removeListener("data", onData);
+      process.stdin.removeListener("end", finish);
+      resolve(text);
+    };
+    const scan = () => {
+      let newlineIdx;
+      while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newlineIdx).trim();
+        buffer = buffer.slice(newlineIdx + 1);
+        if (line.length === 0) continue;
+        try {
+          const parsed = JSON.parse(line);
+          if (typeof parsed?.expectedPromptText === "string" &&
+              parsed.expectedPromptText.length > 0 && parsed.expectedPromptText.length <= RECONCILE_PROMPT_CAP) {
+            text = parsed.expectedPromptText;
+            finish();
+            return;
+          }
+        } catch {
+          /* not a JSON line: skip it */
+        }
+      }
+    };
+    const onData = (chunk) => {
+      buffer += chunk;
+      if (buffer.length > RECONCILE_STDIN_CHAR_CAP) {
+        scan();
+        finish();
+        return;
+      }
+      scan();
+    };
+    const timer = setTimeout(finish, RECONCILE_STDIN_BUDGET_MS);
+    timer.unref?.();
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", onData);
+    process.stdin.on("end", finish);
+    process.stdin.resume();
+  });
+}
+
+/** Collapses all whitespace so desktop-side re-wrapping cannot hide a match. */
+function normalizePromptText(value) {
+  return String(value).replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Whether one conversation user row is the expected prompt text: equal after
+ * whitespace normalization, or containment in either direction guarded by a
+ * minimum length (short legacy user rows must not noise-match a long
+ * instruction). A false match refuses the write-off — the safe direction; an
+ * applied prompt appears verbatim in its user row, so exact equality cannot
+ * miss it.
+ */
+function promptTextMatches(rowText, expected) {
+  const row = normalizePromptText(rowText);
+  const want = normalizePromptText(expected);
+  if (row.length === 0 || want.length === 0) return false;
+  if (row === want) return true;
+  if (want.length >= 16 && row.includes(want)) return true;
+  if (row.length >= 16 && want.includes(row)) return true;
+  return false;
+}
+
+/** Append-only write-off audit trail; one JSON object per line. */
+function reconcileLedgerPath() {
+  return path.join(config.stateDir, "reconcile-ledger.jsonl");
+}
+
+function readReconcileLedger() {
+  let raw;
+  try {
+    raw = readFileSync(reconcileLedgerPath(), "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  const entries = [];
+  for (const line of raw.split("\n")) {
+    if (line.trim().length === 0) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (typeof parsed !== "object" || parsed === null || parsed.v !== 1 || parsed.kind !== "reconcile-dispatch") {
+        throw new Error("invalid reconcile ledger entry");
+      }
+      entries.push(parsed);
+    } catch {
+      // A damaged audit trail is not an empty one. Never release a lock if
+      // duplicate write-offs cannot be checked reliably.
+      throw new Error("reconcile ledger is malformed");
+    }
+  }
+  return entries;
+}
+
+/** The prior write-off of one desktop task, when the ledger holds one. */
+function reconcileLedgerEntryFor(taskId, dshSessionId) {
+  return readReconcileLedger().find((entry) => entry.taskId === taskId && entry.dshSessionId === dshSessionId);
+}
+
+/**
+ * The in-scope binding that owns one desktop task within one workspace. The
+ * workspace filter mirrors `session/adopt`: in session mode a binding of
+ * another workspace never matches, so a task cannot be reconciled from the
+ * wrong workspace's node.
+ */
+function findScopedBindingByDesktopTask(taskId, targetNorm) {
+  for (const binding of listScopedBindings()) {
+    if (binding.desktopSessionId !== taskId) continue;
+    const scopeWorkspace = SESSION_WORKSPACES ? binding.scope.workspace : WORKSPACE_NORM;
+    if (scopeWorkspace !== targetNorm) continue;
+    return binding;
+  }
+  return undefined;
+}
+
+/**
+ * Runs one reconcile pass and returns its report object. Every refusal is a
+ * report with a machine-stable `reason` and no state change; the only state
+ * changes are the confirm-mode ledger append plus the binding dispatch clear.
+ * @returns {Promise<object>} the report; callers print it as one stdout line.
+ */
+async function runReconcileDispatch() {
+  const targetNorm = SESSION_WORKSPACES ? normalizeWorkspacePath(reconcileWorkspace) : WORKSPACE_NORM;
+  const report = {
+    taskId: reconcileTaskId,
+    dshSessionId: null,
+    commandId: null,
+    commandKind: null,
+    issuedAt: null,
+    taskStatus: null,
+    taskUpdatedAt: null,
+    taskUpdatedAfterIssued: null,
+    phase: null,
+    pendingInteractions: null,
+    userTurnCount: null,
+    promptMatched: null,
+    expectedPromptProvided: false,
+    writtenOff: false,
+    alreadyReconciled: false,
+    reconciledAt: new Date().toISOString(),
+    reason: null,
+  };
+  const refuse = (reason) => ({ ...report, reason });
+
+  const binding = findScopedBindingByDesktopTask(reconcileTaskId, targetNorm);
+  if (binding === undefined) return refuse("binding-not-found");
+  report.dshSessionId = binding.dshSessionId;
+  const dispatch = binding.dispatch;
+  if (dispatch === null || dispatch === undefined) {
+    const prior = reconcileLedgerEntryFor(reconcileTaskId, binding.dshSessionId);
+    if (prior !== undefined) {
+      // Idempotent completion evidence for a caller finishing a torn write-off:
+      // reports the completed state, appends nothing, changes nothing.
+      return {
+        ...report,
+        commandId: typeof prior.commandId === "string" ? prior.commandId : null,
+        commandKind: typeof prior.commandKind === "string" ? prior.commandKind : null,
+        issuedAt: typeof prior.issuedAt === "number" ? prior.issuedAt : null,
+        alreadyReconciled: true,
+        writtenOff: true,
+      };
+    }
+    return refuse("nothing-to-reconcile");
+  }
+  report.commandId = typeof dispatch.commandId === "string" ? dispatch.commandId : null;
+  report.commandKind = typeof dispatch.kind === "string" ? dispatch.kind : null;
+  report.issuedAt = typeof dispatch.issuedAt === "number" ? dispatch.issuedAt : null;
+
+  const expected = await readExpectedPromptText();
+  report.expectedPromptProvided = expected !== null;
+
+  try {
+    await link.ensure(SESSION_WORKSPACES ? targetNorm : undefined);
+    await link.conversationEnsure();
+  } catch (error) {
+    return refuse(error instanceof LinkError ? "link-failed" : "evidence-unreadable");
+  }
+  let metas;
+  try {
+    metas = await link.bridge.call("zcode-task", "listTasks", [link.workspaceTarget()]);
+  } catch {
+    return refuse("index-unreadable");
+  }
+  const meta = Array.isArray(metas)
+    ? metas.find((entry) => typeof entry === "object" && entry !== null && entry.taskId === reconcileTaskId)
+    : undefined;
+  if (meta === undefined) return refuse("task-missing");
+  report.taskStatus = typeof meta.status === "string" ? meta.status : null;
+  report.taskUpdatedAt = typeof meta.updatedAt === "number" && Number.isFinite(meta.updatedAt)
+    ? new Date(meta.updatedAt).toISOString()
+    : null;
+  report.taskUpdatedAfterIssued = report.taskUpdatedAt !== null && report.issuedAt !== null
+    ? meta.updatedAt > report.issuedAt
+    : null;
+  if (meta.status === "running") return refuse("task-running");
+  if (meta.status !== "completed" && meta.status !== "error") return refuse("task-status-unknown");
+
+  const stream = new ConversationStream(reconcileTaskId);
+  try {
+    try {
+      await stream.attach();
+      await stream.waitForSnapshot(config.requestTimeoutMs);
+    } catch {
+      return refuse("snapshot-unreadable");
+    }
+    report.phase = stream.projection.phase;
+    report.pendingInteractions = stream.projection.pendingInteractions.length;
+    if (!TERMINAL_PHASES.has(stream.projection.phase)) return refuse("phase-not-terminal");
+    if (stream.projection.pendingInteractions.length > 0) return refuse("awaiting-input");
+    let userTurnCount = 0;
+    let matched = false;
+    for (const row of stream.projection.rows.values()) {
+      if (row.kind !== "userInput" || typeof row.text !== "string") continue;
+      userTurnCount += 1;
+      if (expected !== null && promptTextMatches(row.text, expected)) matched = true;
+    }
+    report.userTurnCount = userTurnCount;
+    report.promptMatched = expected !== null ? matched : null;
+    if (matched) return refuse("prompt-matched");
+    if (reconcileConfirm) {
+      if (expected === null) return refuse("expected-prompt-missing");
+      if (readReconcileLedger().some((entry) => entry.commandId === report.commandId && entry.taskId === reconcileTaskId)) {
+        // A torn write-off: the audit entry exists but the binding write never
+        // landed, so the ledger and the lock disagree. Refusing names the
+        // conflict instead of writing a second entry over a locked binding.
+        return refuse("ledger-conflict");
+      }
+      const entry = {
+        v: 1,
+        kind: "reconcile-dispatch",
+        taskId: reconcileTaskId,
+        dshSessionId: binding.dshSessionId,
+        commandId: report.commandId,
+        commandKind: report.commandKind,
+        issuedAt: report.issuedAt,
+        evidence: {
+          taskStatus: report.taskStatus,
+          taskUpdatedAt: report.taskUpdatedAt,
+          phase: report.phase,
+          pendingInteractions: report.pendingInteractions,
+          promptMatched: false,
+          userTurnCount: report.userTurnCount,
+        },
+        mode: "human-verified",
+        operatorSource: reconcileOperator ?? "cli",
+        at: new Date().toISOString(),
+      };
+      try {
+        appendFileSync(reconcileLedgerPath(), `${JSON.stringify(entry)}\n`);
+      } catch {
+        return refuse("ledger-write-failed");
+      }
+      // The audit entry exists before the lock clears; a failure here leaves
+      // the ledger written but the binding locked, and the next confirm run
+      // refuses on the command-id duplicate instead of writing twice.
+      binding.dispatch = null;
+      writeBinding(binding);
+      return { ...report, writtenOff: true };
+    }
+    return { ...report };
+  } finally {
+    await stream.dispose();
+  }
+}
+
+if (reconcileMode) {
+  let report;
+  try {
+    report = await runReconcileDispatch();
+  } catch (error) {
+    // A throw here is an internal defect, never a desktop verdict; nothing was
+    // written and the fixed-string reason says so.
+    report = { reason: "internal-error" };
+    process.stderr.write(`[${ADAPTER_NAME}] reconcile: failed (${error instanceof Error ? error.name : "unknown"})\n`);
+  }
+  link.dispose();
+  process.stdout.write(`[${ADAPTER_NAME}] reconcile: ${JSON.stringify(report)}\n`);
+  if (report.reason !== null) {
+    process.stderr.write(`[${ADAPTER_NAME}] reconcile: refused (${report.reason}); nothing was written off\n`);
+    process.exitCode = 1;
+  } else {
+    process.exitCode = 0;
+  }
+  // Same deferred exit as --health: never unwind the module graph synchronously.
   setImmediate(() => process.exit(process.exitCode ?? 1));
 }
 
@@ -1898,6 +2624,12 @@ async function dispatchRequest(method, params) {
     case "session/load":
       try {
         return await handleLoadSession(params);
+      } finally {
+        if (turnInFlight === null) link.dispose();
+      }
+    case "session/adopt":
+      try {
+        return await handleAdoptSession(params);
       } finally {
         if (turnInFlight === null) link.dispose();
       }

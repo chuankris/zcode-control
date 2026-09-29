@@ -16,6 +16,9 @@
 //   ZCODE_FAKE_STOP_ERROR     when set, the stop command throws it (cancel path)
 //   ZCODE_FAKE_REGISTER_ERROR when set, zcode-task/createTask throws it
 //   ZCODE_FAKE_REGISTER_DELAY_MS delays registration so turn frames can race it
+//   ZCODE_FAKE_TASK_LIST       JSON map bridge-workspace-key → ZCodeTaskMeta[]
+//                             served by zcode-task/listTasks
+//   ZCODE_FAKE_LIST_TASKS_ERROR when set, zcode-task/listTasks throws it
 //   ZCODE_FAKE_V4_SCRIPT_FILE JSON conversation-frame script:
 //                             { subscribeFrames: [...], frames: [...],
 //                               resyncFrames: [...], stopFrames: [...],
@@ -297,7 +300,17 @@ export class RemoteBridgeSession {
         this.play(turns[turnIndex], turnIndex);
         commandCount += 1;
       }
-      return readJsonEnv("ZCODE_FAKE_ACK", { status: "accepted", result: { sessionId: "dtask-1" } });
+      const ack = readJsonEnv("ZCODE_FAKE_ACK", { status: "accepted", result: { sessionId: "dtask-1" } });
+      // The real desktop echoes the dispatched command id on its acknowledgement;
+      // flat fixtures that omit one are filled in so they stay contract-faithful.
+      if (
+        typeof envelope?.commandId === "string" &&
+        typeof (ack as { commandId?: unknown }).commandId === "undefined" &&
+        typeof (ack as { status?: unknown }).status === "string"
+      ) {
+        return { ...(ack as Record<string, unknown>), commandId: envelope.commandId };
+      }
+      return ack;
     }
     if (channel === "zcode-task" && name === "createTask") {
       const delayMs = Number(process.env.ZCODE_FAKE_REGISTER_DELAY_MS ?? 0);
@@ -305,6 +318,16 @@ export class RemoteBridgeSession {
       const registerError = process.env.ZCODE_FAKE_REGISTER_ERROR;
       if (registerError !== undefined) throw new Error(registerError);
       return { taskId: (args[0] as { draftSessionId?: string })?.draftSessionId };
+    }
+    if (channel === "zcode-task" && name === "listTasks") {
+      // The desktop's synced task index, workspace-scoped: a map from bridge
+      // workspace key (identity, else path) to ZCodeTaskMeta rows.
+      const listError = process.env.ZCODE_FAKE_LIST_TASKS_ERROR;
+      if (listError !== undefined) throw new Error(listError);
+      const byKey = readJsonEnv("ZCODE_FAKE_TASK_LIST", {}) as Record<string, unknown>;
+      const scope = args[0] as { workspacePath?: string; workspaceIdentity?: string } | undefined;
+      const key = scope?.workspaceIdentity ?? scope?.workspacePath ?? "";
+      return Array.isArray(byKey[key]) ? byKey[key] : [];
     }
     if (channel === "zcode-task") {
       throw new Error(`fake: zcode-task/${name} is intentionally unsupported (the adapter must not read stale snapshots)`);

@@ -1,0 +1,13 @@
+# Test-only profile overlay inserting the workbench plugin beside the web tree.
+# The state directory and token file live in the test's private temporary
+# directory; production deployments keep both outside the repository.
+- insert:
+    - id: zcode-workbench
+      name: '@deepseek-ai/dsh-experimental-zcode-workbench'
+      config:
+        stateDir: !!js __STATE_DIR__
+        ingressPath: '/zcode-workbench/ingress'
+        ingressTokenFile: !!js __TOKEN_FILE__
+        maxTasks: 50
+        dispatchTimeoutMs: 15000
+        healthTimeoutMs: 5000

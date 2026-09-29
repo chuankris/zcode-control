@@ -1,7 +1,10 @@
 {
   "adapterSource": "deephik-progo/integrations/zcode-desktop-adapter",
-  "adapterRepositoryCommit": "0b12772689bb6289e3405f241e57cf0f148d7d9a",
+  "adapterRepositoryCommit": "d0abf64c0b40d6e58002401dfc9ba5ceb5cd4000",
   "adapterSnapshot": "current working files",
+  "handoffArchive": "zcode-workbench-handoff-20260929-094910.zip",
+  "handoffArchiveSha256": "75bdf3f25ae4e65d011855b38559813f3764b132fdc733a86810ba601bd0a14d",
+  "workbenchPackageVersion": "0.1.5-rc.2",
   "remoteClientRepository": "https://github.com/valeriikot/zcode-cli.git",
   "remoteClientCommit": "dd001952e2bac15c28d370f204c33f7d96d0d3ef"
 }

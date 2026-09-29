@@ -153,7 +153,7 @@ function scenario({ workspace = WORKSPACE, requestTimeoutMs = 1500, pollInterval
   };
 }
 
-function fakeEnv(sc, { script, bootstrap, ack, sendError, stopError, registerError, registerDelayMs, bootstrapDelayMs, connectError } = {}) {
+function fakeEnv(sc, { script, bootstrap, ack, sendError, stopError, registerError, registerDelayMs, bootstrapDelayMs, connectError, taskList, listTasksError } = {}) {
   if (script !== undefined) writeFileSync(sc.scriptFile, JSON.stringify(script));
   const env = {
     ZCODE_FAKE_JOURNAL: sc.journalFile,
@@ -167,6 +167,8 @@ function fakeEnv(sc, { script, bootstrap, ack, sendError, stopError, registerErr
     ...(registerDelayMs === undefined ? {} : { ZCODE_FAKE_REGISTER_DELAY_MS: String(registerDelayMs) }),
     ...(bootstrapDelayMs === undefined ? {} : { ZCODE_FAKE_BOOTSTRAP_DELAY_MS: String(bootstrapDelayMs) }),
     ...(connectError === undefined ? {} : { ZCODE_FAKE_CONNECT_ERROR: connectError }),
+    ...(taskList === undefined ? {} : { ZCODE_FAKE_TASK_LIST: JSON.stringify(taskList) }),
+    ...(listTasksError === undefined ? {} : { ZCODE_FAKE_LIST_TASKS_ERROR: listTasksError }),
   };
   return { ...process.env, ...env };
 }
@@ -646,6 +648,238 @@ test("a lost ack records an unresolved dispatch and blocks further prompts witho
     assert.equal(blocked.error.code, -32002);
     assert.match(blocked.error.message, /outcome is unknown/);
     assert.equal(journalCalls(sc).filter((call) => call.name === "sendConversationCommandV4").length, 1, "never resend an unresolved command");
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+// ---------- sendConversationCommandV4 acknowledgement contract (3.14.x) ----------
+//
+// The official contract (ZCode-official 3.14.0 commandAckSchema; the 3.14.3
+// desktop bundle's assertV4CommandAckOk) carries a finite status set —
+// accepted/rejected/stale/duplicate/noop/failed — either flat on the RPC reply
+// (observed live 2026-09-21) or nested under `ack` like the other conversation
+// RPC results (subscribeConversationV4 observed live 2026-09-28). Recognition
+// stays strict: an unknown shape, an unknown status value, or a reply naming
+// another command is never a confirmation, and a refusal never counts as
+// delivery.
+
+const ackOf = (status, extra = {}) => ({ status, revisionAtDecision: 1, ...extra });
+const sendCount = (sc) => journalCalls(sc).filter((call) => call.name === "sendConversationCommandV4").length;
+const createTaskCount = (sc) =>
+  journalCalls(sc).filter((call) => call.channel === "zcode-task" && call.name === "createTask").length;
+const bindingOf = (sc, sessionId) => JSON.parse(readFileSync(path.join(sc.bindingsDir, `${sessionId}.json`), "utf8"));
+
+test("a flat accepted ack echoing the command id confirms a fresh dispatch", async () => {
+  const sc = scenario();
+  const script = {
+    frames: [
+      snapWire(1, { phase: "running" }),
+      deltaWire(1, 2, [appended(assistantRow(2, "Confirmed. FLAT_OK"))]),
+      deltaWire(2, 3, [terminal()]),
+    ],
+  };
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script,
+    ack: ackOf("accepted", { result: { type: "createSession", sessionId: DESKTOP_SESSION } }),
+  }));
+  try {
+    await initialize(adapter);
+    const sessionId = (await adapter.request("session/new", {})).result.sessionId;
+    const prompt = adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("flat ack please") });
+    const chunk = await adapter.waitForNotification(
+      (n) => n.method === "session/update" && n.params.update.content?.text === "Confirmed. FLAT_OK",
+    );
+    assert.equal(chunk.params.sessionId, sessionId);
+    assert.equal((await prompt).result.stopReason, "end_turn");
+    assert.equal(sendCount(sc), 1);
+    assert.equal(createTaskCount(sc), 1);
+    const binding = bindingOf(sc, sessionId);
+    assert.equal(binding.desktopSessionId, DESKTOP_SESSION);
+    assert.equal(binding.dispatch, null);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("an enveloped accepted ack confirms a continuation dispatch exactly once", async () => {
+  const sc = scenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: adoptTerminalScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    ack: { ack: ackOf("accepted") },
+  }));
+  try {
+    await initialize(adapter);
+    const sessionId = (await adapter.request("session/adopt", { taskId: DESKTOP_SESSION })).result.sessionId;
+    const prompt = adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("Round two please") });
+    const chunk = await adapter.waitForNotification(
+      (n) => n.method === "session/update" && n.params.update.content?.text === "Round two done",
+    );
+    assert.equal(chunk.params.sessionId, sessionId);
+    assert.equal((await prompt).result.stopReason, "end_turn");
+    assert.equal(sendCount(sc), 1, "exactly one desktop command may leave the process");
+    assert.equal(createTaskCount(sc), 0, "an adopted task must never be re-registered");
+    assert.equal(bindingOf(sc, sessionId).dispatch, null);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("an explicit rejection names its reason, clears the ledger, and allows exactly one fresh dispatch", async () => {
+  const sc = scenario();
+  const script = { frames: [snapWire(1, { phase: "running" })] };
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script,
+    ack: ackOf("rejected", { reasonCode: "fault.command.clientMismatch", message: "terminal binding lost" }),
+  }));
+  try {
+    await initialize(adapter);
+    const sessionId = (await adapter.request("session/new", {})).result.sessionId;
+    const first = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("one") });
+    assert.equal(first.error.code, -32005);
+    assert.match(first.error.message, /refused the createSession command/);
+    assert.match(first.error.message, /status rejected/);
+    assert.match(first.error.message, /fault\.command\.clientMismatch/);
+    assert.equal(bindingOf(sc, sessionId).dispatch, null, "a proven refusal was never applied; the ledger must clear");
+    assert.equal(createTaskCount(sc), 0);
+    const second = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("two") });
+    assert.match(second.error.message, /refused the createSession command/, "the fresh retry dispatches once more");
+    assert.equal(sendCount(sc), 2, "exactly one fresh retry after the refusal, never more");
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("a stale resolution is a proven non-application: refused, ledger cleared, no task created", async () => {
+  const sc = scenario();
+  const script = { frames: [snapWire(1, { phase: "running" })] };
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script,
+    ack: ackOf("stale", { reasonCode: "proto.revisionMoved" }),
+  }));
+  try {
+    await initialize(adapter);
+    const sessionId = (await adapter.request("session/new", {})).result.sessionId;
+    const failed = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("one") });
+    assert.equal(failed.error.code, -32005);
+    assert.match(failed.error.message, /refused the createSession command/);
+    assert.match(failed.error.message, /status stale/);
+    assert.equal(bindingOf(sc, sessionId).dispatch, null);
+    assert.equal(createTaskCount(sc), 0);
+    assert.equal(sendCount(sc), 1);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("a failed resolution keeps the dispatch blocked and reports the unknown outcome", async () => {
+  const sc = scenario();
+  const script = { frames: [snapWire(1, { phase: "running" })] };
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script,
+    ack: ackOf("failed", { reasonCode: "fault.command.transport" }),
+  }));
+  try {
+    await initialize(adapter);
+    const sessionId = (await adapter.request("session/new", {})).result.sessionId;
+    const failed = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("one") });
+    assert.equal(failed.error.code, -32005);
+    assert.match(failed.error.message, /failed the createSession command/);
+    assert.match(failed.error.message, /outcome is unknown/);
+    const binding = bindingOf(sc, sessionId);
+    assert.equal(typeof binding.dispatch.commandId, "string", "an unproven application keeps the ledger blocking");
+    const blocked = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("two") });
+    assert.equal(blocked.error.code, -32002);
+    assert.match(blocked.error.message, /outcome is unknown/);
+    assert.equal(sendCount(sc), 1);
+    assert.equal(createTaskCount(sc), 0);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("a noop resolution is recognized as not applied and keeps the dispatch blocked", async () => {
+  const sc = scenario();
+  const script = { frames: [snapWire(1, { phase: "running" })] };
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script,
+    ack: ackOf("noop", { reasonCode: "proto.alreadyResolved" }),
+  }));
+  try {
+    await initialize(adapter);
+    const sessionId = (await adapter.request("session/new", {})).result.sessionId;
+    const failed = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("one") });
+    assert.equal(failed.error.code, -32005);
+    assert.match(failed.error.message, /noop, not applied/);
+    assert.match(failed.error.message, /proto\.alreadyResolved/);
+    assert.equal(typeof bindingOf(sc, sessionId).dispatch.commandId, "string", "not-applied still blocks until a human verifies the desktop");
+    const blocked = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("two") });
+    assert.equal(blocked.error.code, -32002);
+    assert.equal(sendCount(sc), 1);
+    assert.equal(createTaskCount(sc), 0);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("unrecognized acknowledgements never confirm: unknown status, foreign command id, conflicting shapes", async () => {
+  const variants = [
+    { name: "status outside the proven enum", ack: ackOf("celebrated") },
+    { name: "ack naming another command", ack: ackOf("accepted", { commandId: "11111111-1111-4111-8111-111111111111" }) },
+    { name: "two conflicting known statuses", ack: { status: "accepted", revisionAtDecision: 1, ack: ackOf("rejected") } },
+  ];
+  for (const variant of variants) {
+    const sc = scenario();
+    const script = { frames: [snapWire(1, { phase: "running" })] };
+    const adapter = new AdapterProc(sc, fakeEnv(sc, { script, ack: variant.ack }));
+    try {
+      await initialize(adapter);
+      const sessionId = (await adapter.request("session/new", {})).result.sessionId;
+      const failed = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("one") });
+      assert.equal(failed.error.code, -32005, variant.name);
+      assert.match(failed.error.message, /unrecognized acknowledgement/, variant.name);
+      assert.match(failed.error.message, /outcome is unknown/, variant.name);
+      assert.equal(typeof bindingOf(sc, sessionId).dispatch.commandId, "string", variant.name);
+      const blocked = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("two") });
+      assert.equal(blocked.error.code, -32002, variant.name);
+      assert.equal(sendCount(sc), 1, `never resend on an unrecognized reply (${variant.name})`);
+      assert.equal(createTaskCount(sc), 0, variant.name);
+    } finally {
+      await adapter.stop();
+      await cleanup(sc);
+    }
+  }
+});
+
+test("an enveloped accepted stop ack verifies the desktop stop", async () => {
+  const sc = scenario();
+  const script = {
+    frames: [snapWire(1, { phase: "running" })],
+    stopFrames: [deltaWire(1, 2, [terminal("completedInterrupted")])],
+  };
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script,
+    ack: { ack: ackOf("accepted", { result: { type: "createSession", sessionId: DESKTOP_SESSION } }) },
+  }));
+  try {
+    await initialize(adapter);
+    const sessionId = (await adapter.request("session/new", {})).result.sessionId;
+    const prompt = adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("long task") });
+    await waitForJournal(sc, (entry) => entry.kind === "call" && entry.value?.name === "sendConversationCommandV4");
+    adapter.notify("session/cancel", { sessionId });
+    const settled = await prompt;
+    assert.equal(settled.error, undefined);
+    assert.equal(settled.result.stopReason, "cancelled");
+    const stops = journalCalls(sc).filter((call) => call.args[0]?.envelope?.type === "stop");
+    assert.equal(stops.length, 1);
   } finally {
     await adapter.stop();
     await cleanup(sc);
@@ -1879,7 +2113,8 @@ test("selecting a workspace pins it: prompt dispatches createSession to exactly 
     const option = chosen.result.configOptions.find((entry) => entry.id === "workspace");
     assert.equal(option.currentValue, "D:\\site-ws-b");
     const binding = JSON.parse(readFileSync(path.join(sc.bindingsDir, `${sessionId}.json`), "utf8"));
-    assert.equal(binding.scope.workspace, "d:/site-ws-b");
+    const expectedWorkspace = process.platform === "win32" ? "d:/site-ws-b" : "D:/site-ws-b";
+    assert.equal(binding.scope.workspace, expectedWorkspace);
     assert.equal(binding.workspace.identity, "site-wid-b");
     const update = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("Fix the login bug") });
     assert.equal(update.error, undefined);
@@ -2257,4 +2492,1082 @@ test("config validation keeps fixed mode strict and session mode unambiguous", a
   assert.match(badMode.err, /workspaceSelection must be/);
 
   rmSync(baseDir, { recursive: true, force: true });
+});
+
+// ---------- --list-tasks: one read-only desktop task-index listing ----------
+
+/** Parses the single `[adapter] tasks: <json>` stdout line. */
+function parseTasksLine(out) {
+  const line = out.split("\n").map((part) => part.trim()).find((part) => part.includes("] tasks: "));
+  assert.ok(line, "a tasks line must be printed");
+  return JSON.parse(line.slice(line.indexOf("] tasks: ") + "] tasks: ".length));
+}
+
+const SITE_TASK_LIST = {
+  "site-wid-a": [
+    { taskId: "dtask-site-1", title: "older site task", status: "completed", createdAt: 1730000000000, updatedAt: 1730000500000 },
+    { taskId: "dtask-site-2", title: "newer site task mentioning https://relay.example/secret", createdAt: 1730001000000, updatedAt: 1730002000000 },
+    { taskId: "dtask-site-3", title: "unset status falls back", createdAt: 1730003000000, updatedAt: 1730003000000 },
+    { taskId: "", title: "invalid row is skipped", createdAt: 1, updatedAt: 1 },
+    { title: "row without an id is skipped", createdAt: 1, updatedAt: 1 },
+  ],
+  "site-wid-b": [
+    { taskId: "dtask-other-ws", title: "belongs to workspace B", status: "error", createdAt: 1, updatedAt: 1730009000000 },
+  ],
+};
+
+test("--list-tasks lists one workspace's synced desktop tasks, scoped and scrubbed", async () => {
+  const sc = siteScenario();
+  const env = fakeEnv(sc, {
+    bootstrap: SITE_BOOTSTRAP,
+    taskList: SITE_TASK_LIST,
+  });
+  const result = await runAdapterOnce(["--config", sc.configFile, "--list-tasks", "D:\\site-ws-a"], env);
+  assert.equal(result.code, 0);
+  const report = parseTasksLine(result.out);
+  assert.equal(report.desktopVersion, "3.14.0-fake");
+  assert.deepEqual(
+    report.tasks.map((task) => task.taskId),
+    // newest-updated first; invalid rows skipped; other workspaces never leak in
+    ["dtask-site-3", "dtask-site-2", "dtask-site-1"],
+  );
+  assert.equal(report.tasks[0].status, "unknown");
+  assert.match(report.tasks[1].title, /newer site task mentioning \[url\]/);
+  assert.equal(report.tasks[2].status, "completed");
+  for (const task of report.tasks) {
+    assert.equal(task.origin, "desktop");
+    assert.equal(task.dshSessionId, undefined);
+    assert.match(task.createdAt, /^\d{4}-\d{2}-\d{2}T/);
+    assert.match(task.updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+  }
+  // The listing is one read-only controller pass scoped to the exact workspace.
+  const calls = journalCalls(sc);
+  const listCall = calls.find((call) => call.channel === "zcode-task" && call.name === "listTasks");
+  assert.ok(listCall, "listTasks must be called through the bridge");
+  assert.equal(listCall.args[0].workspacePath, "D:\\site-ws-a");
+  assert.equal(listCall.args[0].workspaceIdentity, "site-wid-a");
+  assert.equal(readJournal(sc).filter((entry) => entry.kind === "connect").length, 1);
+  assertNoSecrets(result.out + result.err);
+  await cleanup(sc);
+});
+
+test("--list-tasks marks tasks this adapter owns as workbench-origin with the dsh session id", async () => {
+  const sc = siteScenario();
+  // A real dispatched turn first: it mints a binding with desktopSessionId
+  // dtask-owned-1 registered for workspace A. The scripted frames carry the
+  // owned session's conversation topic so the live stream observes them.
+  const ownedTopicRewrite = (wire) => ({
+    ...wire,
+    topic: "conversation/dtask-owned-1",
+    frame: { ...wire.frame, topic: "conversation/dtask-owned-1" },
+  });
+  const script = {
+    frames: [
+      snapWire(1, { phase: "running" }),
+      deltaWire(1, 2, [appended(assistantRow(2, "done"))]),
+      deltaWire(2, 3, [terminal()]),
+    ].map(ownedTopicRewrite),
+  };
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    bootstrap: SITE_BOOTSTRAP,
+    script,
+    ack: { status: "accepted", result: { sessionId: "dtask-owned-1" } },
+    taskList: {
+      "site-wid-a": [
+        { taskId: "dtask-owned-1", title: "workbench dispatched", status: "completed", createdAt: 1, updatedAt: 1730010000000 },
+      ],
+    },
+  }));
+  try {
+    await initialize(adapter);
+    const created = await adapter.request("session/new", {});
+    const sessionId = created.result.sessionId;
+    const select = await adapter.request("session/set_config_option", {
+      sessionId, configId: "workspace", value: "D:\\site-ws-a",
+    });
+    assert.equal(select.error, undefined);
+    const prompt = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("own me") });
+    assert.equal(prompt.error, undefined);
+    await adapter.stop();
+
+    const listing = await runAdapterOnce(["--config", sc.configFile, "--list-tasks", "D:\\site-ws-a"], fakeEnv(sc, {
+      bootstrap: SITE_BOOTSTRAP,
+      taskList: {
+        "site-wid-a": [
+          { taskId: "dtask-owned-1", title: "workbench dispatched", status: "completed", createdAt: 1, updatedAt: 1730010000000 },
+          { taskId: "dtask-native", title: "created on the desktop", status: "running", createdAt: 1, updatedAt: 1730005000000 },
+        ],
+      },
+    }));
+    assert.equal(listing.code, 0);
+    const report = parseTasksLine(listing.out);
+    const owned = report.tasks.find((task) => task.taskId === "dtask-owned-1");
+    assert.equal(owned.origin, "workbench");
+    assert.equal(owned.dshSessionId, sessionId);
+    const native = report.tasks.find((task) => task.taskId === "dtask-native");
+    assert.equal(native.origin, "desktop");
+    assert.equal(native.dshSessionId, undefined);
+    assertNoSecrets(listing.out + listing.err);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("--list-tasks failure and validation modes", async () => {
+  // Session node without a workspace path is refused before any connection.
+  const sc = siteScenario();
+  const noPath = await runAdapterOnce(["--config", sc.configFile, "--list-tasks"], fakeEnv(sc, { bootstrap: SITE_BOOTSTRAP }));
+  assert.equal(noPath.code, 2);
+  assert.match(noPath.err, /requires a workspace path/);
+
+  // A workspace the site does not register fails with the exact-match reason.
+  const unknown = await runAdapterOnce(
+    ["--config", sc.configFile, "--list-tasks", "D:\\not-registered"],
+    fakeEnv(sc, { bootstrap: SITE_BOOTSTRAP, taskList: SITE_TASK_LIST }),
+  );
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.err, /configured workspace is not registered/);
+  assertNoSecrets(unknown.out + unknown.err);
+
+  // An unreachable site fails fixed-string without credentials.
+  const offline = await runAdapterOnce(
+    ["--config", sc.configFile, "--list-tasks", "D:\\site-ws-a"],
+    fakeEnv(sc, { connectError: "relay unreachable SECRETSID42" }),
+  );
+  assert.equal(offline.code, 1);
+  assert.match(offline.err, /task listing failed/);
+  assertNoSecrets(offline.out + offline.err);
+
+  // A desktop-side listing error surfaces fixed-string.
+  const rejected = await runAdapterOnce(
+    ["--config", sc.configFile, "--list-tasks", "D:\\site-ws-a"],
+    fakeEnv(sc, { bootstrap: SITE_BOOTSTRAP, listTasksError: "index read failed SECRETHASH42" }),
+  );
+  assert.equal(rejected.code, 1);
+  assert.match(rejected.err, /task listing failed/);
+  assert.match(rejected.err, /\[redacted\]/);
+  assertNoSecrets(rejected.out + rejected.err);
+  await cleanup(sc);
+
+  // Fixed node: no argument lists the pinned workspace; an argument is refused.
+  const fixedSc = scenario();
+  const fixedEnv = fakeEnv(fixedSc, { taskList: { "wid-fake": [{ taskId: "dtask-fixed-1", title: "pinned workspace task", status: "running", createdAt: 1, updatedAt: 1730020000000 }] } });
+  const fixed = await runAdapterOnce(["--config", fixedSc.configFile, "--list-tasks"], fixedEnv);
+  assert.equal(fixed.code, 0);
+  const fixedReport = parseTasksLine(fixed.out);
+  assert.deepEqual(fixedReport.tasks.map((task) => task.taskId), ["dtask-fixed-1"]);
+  const fixedCall = journalCalls(fixedSc).find((call) => call.channel === "zcode-task" && call.name === "listTasks");
+  assert.equal(fixedCall.args[0].workspacePath, "D:\\fake-ws");
+  assert.equal(fixedCall.args[0].workspaceIdentity, "wid-fake");
+  const withPath = await runAdapterOnce(
+    ["--config", fixedSc.configFile, "--list-tasks", "D:\\fake-ws"],
+    fixedEnv,
+  );
+  assert.equal(withPath.code, 2);
+  assert.match(withPath.err, /takes no workspace path/);
+  await cleanup(fixedSc);
+});
+
+// ---------- session/adopt: continue an existing desktop task ----------
+
+/** listTasks rows served for the fixed scenario's bridged workspace key. */
+function fixedTaskList(rows) {
+  return { "wid-fake": rows };
+}
+
+function completedMeta(taskId) {
+  return { taskId, title: `task ${taskId}`, status: "completed", createdAt: 1_700_000_000_000, updatedAt: 1_700_000_100_000 };
+}
+
+const ADOPT_HISTORY = [userRow(1, "old question"), assistantRow(2, "old answer")];
+const adoptTerminalScript = () => ({
+  subscribeTurns: [
+    [snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })],
+    [snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })],
+  ],
+  frames: [
+    deltaWire(10, 11, [appended(userRow(3, "Round two please"))]),
+    deltaWire(11, 12, [appended(assistantRow(4, "Round two done"))]),
+    deltaWire(12, 13, [terminal()]),
+  ],
+});
+
+test("session/adopt continues an existing desktop task via sendText with no createSession and no createTask", async () => {
+  const sc = scenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: adoptTerminalScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+  }));
+  try {
+    await initialize(adapter);
+    const adopted = await adapter.request("session/adopt", { taskId: DESKTOP_SESSION });
+    assert.equal(adopted.error, undefined);
+    assert.equal(adopted.result.created, true);
+    const sessionId = adopted.result.sessionId;
+    assert.match(sessionId, /^zdsk-[0-9a-f-]+$/);
+
+    const prompt = adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("Round two please") });
+    const chunk = await adapter.waitForNotification(
+      (n) => n.method === "session/update" && n.params.update.content?.text === "Round two done",
+    );
+    assert.equal(chunk.params.sessionId, sessionId);
+    assert.equal((await prompt).result.stopReason, "end_turn");
+    assert.equal(
+      adapter.allNotifications.filter((n) => n.params?.update?.content?.text === "old answer").length,
+      0,
+      "pre-adoption history must not stream as new-turn output",
+    );
+
+    const calls = journalCalls(sc);
+    const sends = calls.filter((call) => call.name === "sendConversationCommandV4");
+    assert.equal(sends.length, 1, "exactly one desktop command may leave the process");
+    assert.equal(sends[0].args[0].envelope.type, "sendText");
+    assert.equal(sends[0].args[0].envelope.sessionId, DESKTOP_SESSION, "the desktop stays the same task");
+    assert.equal(sends[0].args[0].envelope.payload.requestedDelivery, "startNow");
+    assert.equal(sends[0].args[0].envelope.payload.text, "Round two please");
+    assert.equal(
+      calls.filter((call) => call.channel === "zcode-task" && call.name === "createTask").length,
+      0,
+      "an adopted task is already registered by the desktop; createTask must never run",
+    );
+    const listCall = calls.find((call) => call.channel === "zcode-task" && call.name === "listTasks");
+    assert.ok(listCall, "adoption must verify the task through the official listTasks index");
+    assert.equal(listCall.args[0].workspaceIdentity, "wid-fake");
+
+    const binding = JSON.parse(readFileSync(path.join(sc.bindingsDir, `${sessionId}.json`), "utf8"));
+    assert.equal(binding.desktopSessionId, DESKTOP_SESSION);
+    assert.equal(binding.registration, "adopted");
+    assert.equal(binding.dispatch, null);
+    assertNoSecrets(adapter.stderrText);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("session/adopt refuses tasks it cannot prove completed; nothing is bound or sent", async () => {
+  const cases = [
+    {
+      name: "task missing from the workspace index",
+      taskList: fixedTaskList([completedMeta("dtask-other")]),
+      message: /not in this workspace's synced task index/,
+    },
+    {
+      name: "index reports the task running",
+      taskList: fixedTaskList([{ ...completedMeta(DESKTOP_SESSION), status: "running" }]),
+      message: /not completed \(running\)/,
+    },
+    {
+      name: "index reports the task in error",
+      taskList: fixedTaskList([{ ...completedMeta(DESKTOP_SESSION), status: "error" }]),
+      message: /not completed \(error\)/,
+    },
+    {
+      name: "index completed but the live conversation is still running",
+      script: { subscribeTurns: [[snapWire(10, { phase: "running", rows: ADOPT_HISTORY })]] },
+      taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+      message: /live conversation is still running or awaiting input/,
+    },
+    {
+      name: "index completed but the live conversation awaits input",
+      script: { subscribeTurns: [[snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY, pendingInteractions: [{ id: "ask-1" }] })]] },
+      taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+      message: /live conversation is still running or awaiting input/,
+    },
+  ];
+  for (const testCase of cases) {
+    const sc = scenario();
+    const adapter = new AdapterProc(sc, fakeEnv(sc, {
+      ...(testCase.script === undefined ? {} : { script: testCase.script }),
+      taskList: testCase.taskList,
+    }));
+    try {
+      await initialize(adapter);
+      const adopted = await adapter.request("session/adopt", { taskId: DESKTOP_SESSION });
+      assert.equal(adopted.error.code, -32002, testCase.name);
+      assert.match(adopted.error.message, testCase.message, testCase.name);
+      assert.deepEqual(readdirSync(sc.bindingsDir), [], `${testCase.name}: no binding may persist`);
+      assert.equal(
+        journalCalls(sc).filter((call) => call.name === "sendConversationCommandV4").length,
+        0,
+        `${testCase.name}: nothing may be dispatched`,
+      );
+    } finally {
+      await adapter.stop();
+      await cleanup(sc);
+    }
+  }
+});
+
+test("session/adopt reuses the binding a workbench dispatch already created, across adapter restarts", async () => {
+  const sc = scenario();
+  const firstScript = {
+    frames: [
+      snapWire(1, { phase: "running" }),
+      deltaWire(1, 2, [appended(assistantRow(2, "First round done"))]),
+      deltaWire(2, 3, [terminal()]),
+    ],
+  };
+  const first = new AdapterProc(sc, fakeEnv(sc, { script: firstScript }));
+  let dispatchSessionId;
+  try {
+    await initialize(first);
+    dispatchSessionId = (await first.request("session/new", {})).result.sessionId;
+    const prompt = first.request("session/prompt", { sessionId: dispatchSessionId, prompt: await promptBlocks("First round") });
+    assert.equal((await prompt).result.stopReason, "end_turn");
+  } finally {
+    await first.stop();
+  }
+  try {
+    const second = new AdapterProc(sc, fakeEnv(sc, {
+      script: adoptTerminalScript(),
+      taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    }));
+    try {
+      await initialize(second);
+      const adopted = await second.request("session/adopt", { taskId: DESKTOP_SESSION });
+      assert.equal(adopted.error, undefined);
+      assert.equal(adopted.result.created, false, "the dispatched binding must be reused, not duplicated");
+      assert.equal(adopted.result.sessionId, dispatchSessionId);
+      const binding = JSON.parse(readFileSync(path.join(sc.bindingsDir, `${dispatchSessionId}.json`), "utf8"));
+      assert.equal(binding.registration, "registered");
+      assert.deepEqual(readdirSync(sc.bindingsDir), [`${dispatchSessionId}.json`], "exactly one binding owns the desktop task");
+    } finally {
+      await second.stop();
+    }
+  } finally {
+    await cleanup(sc);
+  }
+});
+
+test("an adopted binding survives an adapter restart: replay plus a second sendText round, still one task", async () => {
+  const sc = scenario();
+  const first = new AdapterProc(sc, fakeEnv(sc, {
+    script: adoptTerminalScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+  }));
+  let sessionId;
+  try {
+    await initialize(first);
+    sessionId = (await first.request("session/adopt", { taskId: DESKTOP_SESSION })).result.sessionId;
+    const prompt = first.request("session/prompt", { sessionId, prompt: await promptBlocks("Round two please") });
+    assert.equal((await prompt).result.stopReason, "end_turn");
+  } finally {
+    await first.stop();
+  }
+  try {
+    const roundTwoHistory = [...ADOPT_HISTORY, userRow(3, "Round two please"), assistantRow(4, "Round two done")];
+    const secondScript = {
+      subscribeTurns: [
+        [snapWire(20, { phase: "completedSuccess", rows: roundTwoHistory })],
+        [snapWire(20, { phase: "completedSuccess", rows: roundTwoHistory })],
+      ],
+      frames: [
+        deltaWire(20, 21, [appended(userRow(5, "Round three please"))]),
+        deltaWire(21, 22, [appended(assistantRow(6, "Round three done"))]),
+        deltaWire(22, 23, [terminal()]),
+      ],
+    };
+    const second = new AdapterProc(sc, fakeEnv(sc, { script: secondScript, taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]) }));
+    try {
+      await initialize(second);
+      const loaded = await second.request("session/load", { sessionId });
+      assert.equal(loaded.error, undefined);
+      const replay = await second.waitForNotification(
+        (n) => n.method === "session/update" && n.params.update.content?.text === "old answer",
+      );
+      assert.equal(replay.params.sessionId, sessionId);
+
+      const prompt = second.request("session/prompt", { sessionId, prompt: await promptBlocks("Round three please") });
+      assert.equal((await prompt).result.stopReason, "end_turn");
+      const calls = journalCalls(sc);
+      const sends = calls.filter((call) => call.name === "sendConversationCommandV4");
+      assert.equal(sends.filter((call) => call.args[0].envelope.type === "sendText").length, 2, "both rounds ride sendText");
+      assert.equal(sends.every((call) => call.args[0].envelope.sessionId === DESKTOP_SESSION), true, "the desktop task id never changes");
+      assert.equal(
+        calls.filter((call) => call.channel === "zcode-task" && call.name === "createTask").length,
+        0,
+        "an adopted task is never re-registered through createTask, even after a restart",
+      );
+    } finally {
+      await second.stop();
+    }
+  } finally {
+    await cleanup(sc);
+  }
+});
+
+test("a turn whose terminal patch precedes the full-text row still streams the complete answer", async () => {
+  const sc = scenario();
+  // Live-desktop shape observed 2026-09-28 (continuation round on a real
+  // task): the phase flipped to running, the reply row's first drained
+  // version carried partial text, the terminal patch landed right behind it,
+  // and the full-text row.upserted followed the terminal patch. Ending the
+  // turn on the first terminal observation dropped that tail — the workbench
+  // recorded "CONT" while the desktop's own snapshot held "CONTINUE_SMOKE_OK"
+  // (proven by a later session/load replay). The gate parks the full-text
+  // frame so the terminal provably lands first; writing the release file is
+  // the latch that lets the tail through while the turn still settles.
+  const gateFile = path.join(sc.dir, "tail-gate.txt");
+  const script = {
+    gate: { turnIndex: 0, frameIndex: 4, releaseFile: gateFile },
+    subscribeTurns: [
+      [snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })],
+      [snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })],
+    ],
+    frames: [
+      deltaWire(10, 11, [appended(userRow(3, "Round two please"))]),
+      deltaWire(11, 12, [stateUpdated({ control: control("running") })]),
+      deltaWire(12, 13, [appended(assistantRow(4, "CONT", "streaming"))]),
+      deltaWire(13, 14, [terminal()]),
+      deltaWire(14, 15, [appended(assistantRow(4, "CONTINUE_SMOKE_OK"))]),
+    ],
+  };
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script,
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+  }));
+  try {
+    await initialize(adapter);
+    const sessionId = (await adapter.request("session/adopt", { taskId: DESKTOP_SESSION })).result.sessionId;
+    const prompt = adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("Round two please") });
+    await adapter.waitForNotification(
+      (n) => n.method === "session/update" && n.params.update.content?.text === "CONT",
+    );
+    // gate-held proves the terminal patch is already on the wire and the
+    // full-text row is not; releasing now lands it inside the settle window.
+    await waitForJournal(sc, (entry) => entry.kind === "gate-held");
+    writeFileSync(gateFile, "");
+    await waitForJournal(sc, (entry) => entry.kind === "gate-released");
+    const settled = await prompt;
+    assert.equal(settled.error, undefined);
+    assert.equal(settled.result.stopReason, "end_turn");
+    const streamed = adapter.allNotifications
+      .filter((n) => n.params?.update?.sessionUpdate === "agent_message_chunk")
+      .map((n) => n.params.update.content.text).join("");
+    assert.equal(streamed, "CONTINUE_SMOKE_OK", "the trailing full-text row must reach the DSH transcript");
+    const calls = journalCalls(sc);
+    const sends = calls.filter((call) => call.name === "sendConversationCommandV4");
+    assert.equal(sends.length, 1, "the command is never re-sent while settling");
+    assert.equal(sends[0].args[0].envelope.type, "sendText");
+    assert.equal(sends[0].args[0].envelope.sessionId, DESKTOP_SESSION, "the desktop stays the same task");
+    assert.equal(
+      calls.filter((call) => call.channel === "zcode-task" && call.name === "createTask").length,
+      0,
+      "no replacement desktop task may be created while settling",
+    );
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("a complete short answer ends the turn through the settle window, not the deadline", async () => {
+  const sc = scenario({ turnTimeoutMs: 2500 });
+  // The initial block is the whole answer and nothing follows the terminal
+  // patch: the turn must converge on its own (quiescence), far inside the
+  // turn budget — never wait for a trailing frame that will not come.
+  const script = {
+    subscribeTurns: [
+      [snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })],
+      [snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })],
+    ],
+    frames: [
+      deltaWire(10, 11, [appended(userRow(3, "Round two please"))]),
+      deltaWire(11, 12, [stateUpdated({ control: control("running") })]),
+      deltaWire(12, 13, [appended(assistantRow(4, "Full short answer"))]),
+      deltaWire(13, 14, [terminal()]),
+    ],
+  };
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script,
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+  }));
+  try {
+    await initialize(adapter);
+    const sessionId = (await adapter.request("session/adopt", { taskId: DESKTOP_SESSION })).result.sessionId;
+    const startedAt = Date.now();
+    const settled = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("Round two please") });
+    assert.equal(settled.error, undefined);
+    assert.equal(settled.result.stopReason, "end_turn");
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed < 2500, `the turn must converge on quiescence, not the deadline (took ${elapsed}ms)`);
+    const streamed = adapter.allNotifications
+      .filter((n) => n.params?.update?.sessionUpdate === "agent_message_chunk")
+      .map((n) => n.params.update.content.text).join("");
+    assert.equal(streamed, "Full short answer");
+    assert.equal(
+      journalCalls(sc).filter((call) => call.name === "sendConversationCommandV4").length,
+      1,
+      "exactly one command leaves the process",
+    );
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("a trailing trickle inside the settle window streams in full before the turn ends", async () => {
+  const sc = scenario({ turnTimeoutMs: 3000 });
+  // The full text arrives as a slow row.delta trickle behind the terminal
+  // patch: every segment is a projection change that restarts the quiet
+  // clock, so the whole tail must stream before the turn ends — and none of
+  // it may be duplicated or re-requested.
+  const script = {
+    frameDelayMs: 100,
+    subscribeTurns: [
+      [snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })],
+      [snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })],
+    ],
+    frames: [
+      deltaWire(10, 11, [appended(userRow(3, "Round two please"))]),
+      deltaWire(11, 12, [stateUpdated({ control: control("running") })]),
+      deltaWire(12, 13, [appended(assistantRow(4, "Tail:"))]),
+      deltaWire(13, 14, [terminal()]),
+      deltaWire(14, 15, [textDelta(4, " one")]),
+      deltaWire(15, 16, [textDelta(4, " two")]),
+      deltaWire(16, 17, [textDelta(4, " three")]),
+      deltaWire(17, 18, [textDelta(4, " done.")]),
+    ],
+  };
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script,
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+  }));
+  try {
+    await initialize(adapter);
+    const sessionId = (await adapter.request("session/adopt", { taskId: DESKTOP_SESSION })).result.sessionId;
+    const settled = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("Round two please") });
+    assert.equal(settled.error, undefined);
+    assert.equal(settled.result.stopReason, "end_turn");
+    const streamed = adapter.allNotifications
+      .filter((n) => n.params?.update?.sessionUpdate === "agent_message_chunk")
+      .map((n) => n.params.update.content.text).join("");
+    assert.equal(streamed, "Tail: one two three done.", "the whole trickle must reach the transcript");
+    const calls = journalCalls(sc);
+    assert.equal(
+      calls.filter((call) => call.name === "sendConversationCommandV4").length,
+      1,
+      "the trickle never justifies a resend",
+    );
+    assert.equal(
+      calls.filter((call) => call.channel === "zcode-task" && call.name === "createTask").length,
+      0,
+    );
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("a lost send acknowledgement keeps the adopted task's ledger and blocks further prompts", async () => {
+  const sc = scenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: adoptTerminalScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    sendError: "relay dropped the command",
+  }));
+  try {
+    await initialize(adapter);
+    const sessionId = (await adapter.request("session/adopt", { taskId: DESKTOP_SESSION })).result.sessionId;
+    const prompt = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("Round two please") });
+    assert.equal(prompt.error.code, -32005);
+    assert.match(prompt.error.message, /outcome is unknown/);
+    const binding = JSON.parse(readFileSync(path.join(sc.bindingsDir, `${sessionId}.json`), "utf8"));
+    assert.equal(binding.desktopSessionId, DESKTOP_SESSION, "the record keeps the adopted task identity");
+    assert.equal(typeof binding.dispatch.commandId, "string", "the unacknowledged command stays on the ledger");
+    const retry = await adapter.request("session/prompt", { sessionId, prompt: await promptBlocks("Round two please") });
+    assert.equal(retry.error.code, -32002);
+    assert.match(retry.error.message, /outcome is unknown/);
+    assert.equal(
+      journalCalls(sc).filter((call) => call.name === "sendConversationCommandV4").length,
+      1,
+      "the command is never re-sent",
+    );
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("session/adopt workspace rules: session mode requires the path, fixed mode refuses it, the task must be in the named workspace", async () => {
+  const siteList = { "site-wid-a": [completedMeta(DESKTOP_SESSION)], "site-wid-b": [] };
+  const siteTerminal = {
+    subscribeTurns: [
+      [snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })],
+      [snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })],
+    ],
+  };
+
+  // Session mode: the workspace pins and scopes the adoption.
+  const sc = siteScenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: siteTerminal,
+    bootstrap: SITE_BOOTSTRAP,
+    taskList: siteList,
+  }));
+  try {
+    await initialize(adapter);
+    const missingPath = await adapter.request("session/adopt", { taskId: DESKTOP_SESSION });
+    assert.equal(missingPath.error.code, -32602);
+    assert.match(missingPath.error.message, /requires the workspacePath/);
+
+    const wrongWorkspace = await adapter.request("session/adopt", { taskId: DESKTOP_SESSION, workspacePath: "D:\\site-ws-b" });
+    assert.equal(wrongWorkspace.error.code, -32002);
+    assert.match(wrongWorkspace.error.message, /not in this workspace's synced task index/);
+
+    const adopted = await adapter.request("session/adopt", { taskId: DESKTOP_SESSION, workspacePath: "D:\\site-ws-a" });
+    assert.equal(adopted.error, undefined);
+    assert.equal(adopted.result.created, true);
+    const normalize = (value) => value.replaceAll("\\", "/").replace(/\/+$/, "");
+    const expected = process.platform === "win32" ? normalize("D:\\site-ws-a").toLowerCase() : normalize("D:\\site-ws-a");
+    const binding = JSON.parse(readFileSync(path.join(sc.bindingsDir, `${adopted.result.sessionId}.json`), "utf8"));
+    assert.equal(binding.scope.workspace, expected, "the adopted binding pins the normalized workspace");
+    assert.equal(binding.workspace.identity, "site-wid-a");
+    // Re-adopting through a differently spelled path of the same workspace reuses the binding.
+    const again = await adapter.request("session/adopt", { taskId: DESKTOP_SESSION, workspacePath: "D:\\site-ws-a\\" });
+    assert.equal(again.error, undefined);
+    assert.equal(again.result.created, false);
+    assert.equal(again.result.sessionId, adopted.result.sessionId);
+    assert.deepEqual(readdirSync(sc.bindingsDir), [`${adopted.result.sessionId}.json`], "no second binding for one desktop task");
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+
+  // Fixed mode: the pin lives in the configuration; an explicit path is a client bug.
+  const fixedSc = scenario();
+  const fixed = new AdapterProc(fixedSc, fakeEnv(fixedSc, {
+    script: siteTerminal,
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+  }));
+  try {
+    await initialize(fixed);
+    const withPath = await fixed.request("session/adopt", { taskId: DESKTOP_SESSION, workspacePath: "D:\\fake-ws" });
+    assert.equal(withPath.error.code, -32602);
+    assert.match(withPath.error.message, /takes no workspace path/);
+  } finally {
+    await fixed.stop();
+    await cleanup(fixedSc);
+  }
+});
+
+// ---------- --reconcile-dispatch: verify-then-release an unresolved dispatch ----------
+//
+// The desktop protocol cannot prove non-application after a lost ack, so the
+// reconcile mode gathers every read-only fact (task-index row, live snapshot
+// phase, pending interactions, prompt-text match) and refuses on any signal of
+// application, unreadable evidence, wrong scope, or a duplicate write-off. The
+// ledger clears only under `--confirm human-verified`, and each write-off is
+// one append-only reconcile-ledger.jsonl entry. No pass ever re-sends a
+// command or creates a desktop task.
+
+const STUCK_PROMPT = "please continue the incident report";
+const RECONCILE_MARKER = "] reconcile: ";
+
+/** Runs one --reconcile-dispatch child; `stdinLine` may be null. */
+function runReconcile(sc, env, { args = [], stdinLine = null } = {}) {
+  return new Promise((resolve) => {
+    const proc = spawn(
+      process.execPath,
+      [ADAPTER, "--config", sc.configFile, "--reconcile-dispatch", ...args],
+      { cwd: path.dirname(ADAPTER), env, stdio: ["pipe", "pipe", "pipe"] },
+    );
+    let out = "";
+    let err = "";
+    proc.stdout.setEncoding("utf8");
+    proc.stdout.on("data", (chunk) => { out += chunk; });
+    proc.stderr.setEncoding("utf8");
+    proc.stderr.on("data", (chunk) => { err += chunk; });
+    if (stdinLine !== null) proc.stdin.write(`${stdinLine}\n`);
+    proc.once("exit", (code) => {
+      const line = out.split("\n").map((part) => part.trim()).find((part) => part.includes(RECONCILE_MARKER));
+      resolve({
+        code, out, err,
+        report: line === undefined ? null : JSON.parse(line.slice(line.indexOf(RECONCILE_MARKER) + RECONCILE_MARKER.length)),
+      });
+    });
+  });
+}
+
+const expectedPromptLine = (text) => JSON.stringify({ expectedPromptText: text });
+const reconcileLedgerLines = (sc) =>
+  existsSync(path.join(sc.stateDir, "reconcile-ledger.jsonl"))
+    ? readFileSync(path.join(sc.stateDir, "reconcile-ledger.jsonl"), "utf8").split("\n").filter((line) => line.length > 0)
+    : [];
+
+/**
+ * Creates one stuck continuation binding the way a lost ack leaves it: adopt a
+ * completed desktop task, then fail the sendText dispatch. Returns the adopted
+ * ACP session id plus the binding's unresolved dispatch record.
+ */
+async function stuckContinuation(sc, adapter) {
+  const adopted = await adapter.request("session/adopt", { taskId: DESKTOP_SESSION });
+  assert.equal(adopted.error, undefined);
+  const failed = await adapter.request("session/prompt", { sessionId: adopted.result.sessionId, prompt: await promptBlocks(STUCK_PROMPT) });
+  assert.equal(failed.error.code, -32005, "the fixture dispatch must fail with an unknown outcome");
+  const binding = bindingOf(sc, adopted.result.sessionId);
+  assert.equal(binding.dispatch.kind, "sendText");
+  assert.equal(typeof binding.dispatch.commandId, "string");
+  return { sessionId: adopted.result.sessionId, dispatch: binding.dispatch };
+}
+
+/** Script for a dispatch process whose sendText fails (baseline stays clean). */
+const stuckDispatchScript = () => ({ subscribeTurns: [[snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })]] });
+
+test("reconcile dry run reports the evidence and writes nothing off", async () => {
+  const sc = scenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: stuckDispatchScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    sendError: "TimeoutError: sendConversationCommandV4 timed out",
+  }));
+  try {
+    const stuck = await stuckContinuation(sc, adapter);
+    const sendCommandsBefore = sendCount(sc);
+    const run = await runReconcile(sc, fakeEnv(sc, {
+      script: stuckDispatchScript(),
+      taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    }), { args: [DESKTOP_SESSION], stdinLine: expectedPromptLine(STUCK_PROMPT) });
+    assert.equal(run.code, 0);
+    assert.equal(run.report.reason, null);
+    assert.equal(run.report.writtenOff, false);
+    assert.equal(run.report.commandKind, "sendText");
+    assert.equal(run.report.commandId, stuck.dispatch.commandId);
+    assert.equal(run.report.taskStatus, "completed");
+    assert.equal(run.report.phase, "completedSuccess");
+    assert.equal(run.report.pendingInteractions, 0);
+    assert.equal(run.report.promptMatched, false);
+    assert.equal(run.report.expectedPromptProvided, true);
+    // Nothing changed: the binding ledger entry and the audit trail are intact.
+    assert.deepEqual(bindingOf(sc, stuck.sessionId).dispatch, stuck.dispatch);
+    assert.equal(reconcileLedgerLines(sc).length, 0);
+    assert.equal(sendCount(sc), sendCommandsBefore, "a reconcile pass never re-sends the old command");
+    assertNoSecrets(`${run.out}\n${run.err}`);
+    assert.ok(!run.out.includes(STUCK_PROMPT), "the expected prompt text must not be echoed");
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("a human-verified confirm clears the ledger, audits the write-off, and reopens the desktop task", async () => {
+  const sc = scenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: stuckDispatchScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    sendError: "TimeoutError: sendConversationCommandV4 timed out",
+  }));
+  const confirmEnv = fakeEnv(sc, {
+    script: stuckDispatchScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+  });
+  try {
+    const stuck = await stuckContinuation(sc, adapter);
+    const run = await runReconcile(sc, confirmEnv, {
+      args: [DESKTOP_SESSION, "--confirm", "human-verified", "--operator", "codex-once"],
+      stdinLine: expectedPromptLine(STUCK_PROMPT),
+    });
+    assert.equal(run.code, 0);
+    assert.equal(run.report.reason, null);
+    assert.equal(run.report.writtenOff, true);
+    assert.equal(bindingOf(sc, stuck.sessionId).dispatch, null, "the adapter-side lock is released");
+    const ledger = reconcileLedgerLines(sc);
+    assert.equal(ledger.length, 1);
+    const entry = JSON.parse(ledger[0]);
+    assert.equal(entry.kind, "reconcile-dispatch");
+    assert.equal(entry.taskId, DESKTOP_SESSION);
+    assert.equal(entry.dshSessionId, stuck.sessionId);
+    assert.equal(entry.commandId, stuck.dispatch.commandId);
+    assert.equal(entry.commandKind, "sendText");
+    assert.equal(entry.mode, "human-verified");
+    assert.equal(entry.operatorSource, "codex-once");
+    assert.equal(entry.evidence.promptMatched, false);
+    assert.ok(!ledger[0].includes(STUCK_PROMPT), "the audit trail never carries the prompt text");
+    assertNoSecrets(ledger[0]);
+
+    // A duplicate confirm reports the completed write-off and appends nothing.
+    const again = await runReconcile(sc, confirmEnv, {
+      args: [DESKTOP_SESSION, "--confirm", "human-verified"],
+      stdinLine: expectedPromptLine(STUCK_PROMPT),
+    });
+    assert.equal(again.code, 0);
+    assert.equal(again.report.alreadyReconciled, true);
+    assert.equal(again.report.writtenOff, true);
+    assert.equal(again.report.commandId, stuck.dispatch.commandId);
+    assert.equal(reconcileLedgerLines(sc).length, 1, "a duplicate changes nothing");
+
+    // The desktop task is continuable again through adoption — no replacement task.
+    await adapter.stop();
+    const reopened = new AdapterProc(sc, confirmEnv);
+    try {
+      const readopt = await reopened.request("session/adopt", { taskId: DESKTOP_SESSION });
+      assert.equal(readopt.error, undefined, "the cleared ledger unblocks adoption of the same desktop task");
+      assert.equal(readopt.result.created, false);
+      assert.equal(createTaskCount(sc), 0, "reconciliation must never create a desktop task");
+    } finally {
+      await reopened.stop();
+    }
+
+    // A torn write-off (ledger entry written, binding write lost) is refused by
+    // naming the conflict; the ledger never gains a second entry over a lock.
+    const tornBinding = bindingOf(sc, stuck.sessionId);
+    tornBinding.dispatch = stuck.dispatch;
+    writeFileSync(path.join(sc.bindingsDir, `${stuck.sessionId}.json`), JSON.stringify(tornBinding, null, 2));
+    const torn = await runReconcile(sc, confirmEnv, {
+      args: [DESKTOP_SESSION, "--confirm", "human-verified"],
+      stdinLine: expectedPromptLine(STUCK_PROMPT),
+    });
+    assert.equal(torn.code, 1);
+    assert.equal(torn.report.reason, "ledger-conflict");
+    assert.equal(reconcileLedgerLines(sc).length, 1);
+    assert.deepEqual(bindingOf(sc, stuck.sessionId).dispatch, stuck.dispatch, "the operator resolves the torn state from the ledger");
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("reconcile keeps the dispatch locked when its audit ledger is unreadable", async () => {
+  const sc = scenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: stuckDispatchScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    sendError: "TimeoutError: sendConversationCommandV4 timed out",
+  }));
+  const confirmEnv = fakeEnv(sc, {
+    script: stuckDispatchScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+  });
+  try {
+    const stuck = await stuckContinuation(sc, adapter);
+    writeFileSync(path.join(sc.stateDir, "reconcile-ledger.jsonl"), '{"v":1,"kind":"reconcile-dispatch"\n');
+    const run = await runReconcile(sc, confirmEnv, {
+      args: [DESKTOP_SESSION, "--confirm", "human-verified"],
+      stdinLine: expectedPromptLine(STUCK_PROMPT),
+    });
+    assert.notEqual(run.code, 0);
+    assert.deepEqual(bindingOf(sc, stuck.sessionId).dispatch, stuck.dispatch);
+    assert.equal(reconcileLedgerLines(sc).length, 1, "the damaged ledger must not be appended to");
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("reconcile refuses when the follow-up prompt appears in the desktop conversation", async () => {
+  const sc = scenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: stuckDispatchScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    sendError: "TimeoutError: sendConversationCommandV4 timed out",
+  }));
+  try {
+    const stuck = await stuckContinuation(sc, adapter);
+    // The live snapshot now shows the old instruction as a user turn: the
+    // command was applied and must never be written off.
+    const appliedScript = {
+      subscribeTurns: [[snapWire(10, { phase: "completedSuccess", rows: [...ADOPT_HISTORY, userRow(3, STUCK_PROMPT)] })]],
+    };
+    const run = await runReconcile(sc, fakeEnv(sc, {
+      script: appliedScript,
+      taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    }), { args: [DESKTOP_SESSION, "--confirm", "human-verified"], stdinLine: expectedPromptLine(STUCK_PROMPT) });
+    assert.equal(run.code, 1);
+    assert.equal(run.report.reason, "prompt-matched");
+    assert.equal(run.report.promptMatched, true);
+    assert.deepEqual(bindingOf(sc, stuck.sessionId).dispatch, stuck.dispatch, "the lock stays");
+    assert.equal(reconcileLedgerLines(sc).length, 0);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("reconcile refuses on a running, unknown, or absent task-index row", async () => {
+  const sc = scenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: stuckDispatchScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    sendError: "TimeoutError: sendConversationCommandV4 timed out",
+  }));
+  try {
+    const stuck = await stuckContinuation(sc, adapter);
+    for (const [rows, reason] of [
+      [[{ ...completedMeta(DESKTOP_SESSION), status: "running" }], "task-running"],
+      [[{ ...completedMeta(DESKTOP_SESSION), status: "paused" }], "task-status-unknown"],
+      [[], "task-missing"],
+    ]) {
+      const run = await runReconcile(sc, fakeEnv(sc, {
+        script: stuckDispatchScript(),
+        taskList: fixedTaskList(rows),
+      }), { args: [DESKTOP_SESSION, "--confirm", "human-verified"], stdinLine: expectedPromptLine(STUCK_PROMPT) });
+      assert.equal(run.code, 1);
+      assert.equal(run.report.reason, reason);
+    }
+    assert.deepEqual(bindingOf(sc, stuck.sessionId).dispatch, stuck.dispatch, "no refusal path unlocked the ledger");
+    assert.equal(reconcileLedgerLines(sc).length, 0);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("reconcile refuses while the live conversation runs or awaits input", async () => {
+  const sc = scenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: stuckDispatchScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    sendError: "TimeoutError: sendConversationCommandV4 timed out",
+  }));
+  try {
+    await stuckContinuation(sc, adapter);
+    for (const [snapshot, reason] of [
+      [{ phase: "running" }, "phase-not-terminal"],
+      [{ phase: "completedSuccess", pendingInteractions: [{ id: "ask-1" }] }, "awaiting-input"],
+    ]) {
+      const script = { subscribeTurns: [[snapWire(10, { rows: ADOPT_HISTORY, ...snapshot })]] };
+      const run = await runReconcile(sc, fakeEnv(sc, {
+        script,
+        taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+      }), { args: [DESKTOP_SESSION, "--confirm", "human-verified"], stdinLine: expectedPromptLine(STUCK_PROMPT) });
+      assert.equal(run.code, 1);
+      assert.equal(run.report.reason, reason);
+    }
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("reconcile refuses outside its scope: wrong task, foreign connection, clean binding", async () => {
+  const sc = scenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: stuckDispatchScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    sendError: "TimeoutError: sendConversationCommandV4 timed out",
+  }));
+  try {
+    await stuckContinuation(sc, adapter);
+
+    // A task no binding owns on this node.
+    const wrongTask = await runReconcile(sc, fakeEnv(sc, {
+      script: stuckDispatchScript(),
+      taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    }), { args: ["dtask-unbound"], stdinLine: expectedPromptLine(STUCK_PROMPT) });
+    assert.equal(wrongTask.code, 1);
+    assert.equal(wrongTask.report.reason, "binding-not-found");
+
+    // A connection-identity change (another device pairing) hides every binding.
+    writeFileSync(sc.urlFile, URL_FILE_CONTENT_OTHER_DEVICE);
+    const foreign = await runReconcile(sc, fakeEnv(sc, {
+      script: stuckDispatchScript(),
+      taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    }), { args: [DESKTOP_SESSION], stdinLine: expectedPromptLine(STUCK_PROMPT) });
+    assert.equal(foreign.code, 1);
+    assert.equal(foreign.report.reason, "binding-not-found");
+    writeFileSync(sc.urlFile, URL_FILE_CONTENT);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+
+  // A binding whose dispatch already settled normally has nothing to reconcile.
+  const clean = scenario();
+  const cleanAdapter = new AdapterProc(clean, fakeEnv(clean, {
+    script: adoptTerminalScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+  }));
+  try {
+    await initialize(cleanAdapter);
+    const adopted = await cleanAdapter.request("session/adopt", { taskId: DESKTOP_SESSION });
+    const run = await runReconcile(clean, fakeEnv(clean, {
+      script: adoptTerminalScript(),
+      taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    }), { args: [DESKTOP_SESSION], stdinLine: expectedPromptLine("anything") });
+    assert.equal(run.code, 1);
+    assert.equal(run.report.reason, "nothing-to-reconcile");
+    assert.equal(adopted.error, undefined);
+    assert.equal(reconcileLedgerLines(clean).length, 0);
+  } finally {
+    await cleanAdapter.stop();
+    await cleanup(clean);
+  }
+});
+
+test("session-mode reconcile is workspace-scoped like adoption", async () => {
+  const sc = siteScenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    bootstrap: SITE_BOOTSTRAP,
+    script: { subscribeTurns: [[snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })]] },
+    taskList: { "site-wid-a": [completedMeta(DESKTOP_SESSION)] },
+    sendError: "TimeoutError: sendConversationCommandV4 timed out",
+  }));
+  try {
+    const adopted = await adapter.request("session/adopt", { taskId: DESKTOP_SESSION, workspacePath: "D:\\site-ws-a" });
+    assert.equal(adopted.error, undefined);
+    const failed = await adapter.request("session/prompt", { sessionId: adopted.result.sessionId, prompt: await promptBlocks(STUCK_PROMPT) });
+    assert.equal(failed.error.code, -32005);
+    const evidenceEnv = fakeEnv(sc, {
+      bootstrap: SITE_BOOTSTRAP,
+      script: { subscribeTurns: [[snapWire(10, { phase: "completedSuccess", rows: ADOPT_HISTORY })]] },
+      taskList: { "site-wid-a": [completedMeta(DESKTOP_SESSION)], "site-wid-b": [] },
+    });
+    // The binding lives in workspace A: asking from workspace B finds nothing.
+    const wrongWorkspace = await runReconcile(sc, evidenceEnv, {
+      args: [DESKTOP_SESSION, "D:\\site-ws-b", "--confirm", "human-verified"],
+      stdinLine: expectedPromptLine(STUCK_PROMPT),
+    });
+    assert.equal(wrongWorkspace.code, 1);
+    assert.equal(wrongWorkspace.report.reason, "binding-not-found");
+    // From its own workspace the same pass succeeds.
+    const ownWorkspace = await runReconcile(sc, evidenceEnv, {
+      args: [DESKTOP_SESSION, "D:\\site-ws-a", "--confirm", "human-verified"],
+      stdinLine: expectedPromptLine(STUCK_PROMPT),
+    });
+    assert.equal(ownWorkspace.code, 0);
+    assert.equal(ownWorkspace.report.writtenOff, true);
+    assert.equal(bindingOf(sc, adopted.result.sessionId).dispatch, null);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
+});
+
+test("confirm without the expected prompt text refuses; argv misuse fails loud", async () => {
+  const sc = scenario();
+  const adapter = new AdapterProc(sc, fakeEnv(sc, {
+    script: stuckDispatchScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+    sendError: "TimeoutError: sendConversationCommandV4 timed out",
+  }));
+  const evidenceEnv = fakeEnv(sc, {
+    script: stuckDispatchScript(),
+    taskList: fixedTaskList([completedMeta(DESKTOP_SESSION)]),
+  });
+  try {
+    const stuck = await stuckContinuation(sc, adapter);
+    // A dry run without stdin still reports the evidence; the prompt facet is null.
+    const dry = await runReconcile(sc, evidenceEnv, { args: [DESKTOP_SESSION] });
+    assert.equal(dry.code, 0);
+    assert.equal(dry.report.reason, null);
+    assert.equal(dry.report.promptMatched, null);
+    assert.equal(dry.report.expectedPromptProvided, false);
+    // Confirming without the text comparison is a hard refusal.
+    const blind = await runReconcile(sc, evidenceEnv, { args: [DESKTOP_SESSION, "--confirm", "human-verified"] });
+    assert.equal(blind.code, 1);
+    assert.equal(blind.report.reason, "expected-prompt-missing");
+    assert.deepEqual(bindingOf(sc, stuck.sessionId).dispatch, stuck.dispatch);
+    // The attestation must be the explicit literal, and the fixed-mode workspace pin is not an argument.
+    const badConfirm = await runReconcile(sc, evidenceEnv, { args: [DESKTOP_SESSION, "--confirm", "yes"], stdinLine: expectedPromptLine(STUCK_PROMPT) });
+    assert.equal(badConfirm.code, 2);
+    assert.match(badConfirm.err, /human-verified/);
+    const badWorkspace = await runReconcile(sc, evidenceEnv, { args: [DESKTOP_SESSION, "D:\\fake-ws"], stdinLine: expectedPromptLine(STUCK_PROMPT) });
+    assert.equal(badWorkspace.code, 2);
+    assert.match(badWorkspace.err, /takes no workspace path/);
+  } finally {
+    await adapter.stop();
+    await cleanup(sc);
+  }
 });
