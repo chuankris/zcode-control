@@ -4,16 +4,20 @@
   display: grid;
   gap: 16px;
   padding: 20px 22px 40px;
-  max-width: 1180px;
+  max-width: 1400px;
   margin: 0 auto;
   color: var(--dsw-alias-label-primary, #edf3fa);
 }
 
 .pageHead {
   display: flex;
+  /* Wraps instead of squeezing: on narrow viewports (the DSH outer sidebar
+     consumes width) the header stacks and the CTA keeps a full row, so its
+     Chinese label never renders char-by-char vertically. */
+  flex-wrap: wrap;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 20px;
+  gap: 12px 20px;
 }
 
 .pageHead h1,
@@ -21,6 +25,7 @@
   margin: 0 0 6px;
   font-size: 22px;
   letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
 }
 
 .pageHead p {
@@ -28,6 +33,32 @@
   color: var(--dsw-alias-label-secondary, #93a0b2);
   max-width: 720px;
   font-size: 13px;
+}
+
+/* The header CTA never shrinks below its label: a squeezed primary button is
+   unreadable and untouchable. Below 480px it takes a full row instead. */
+.pageHead .primary {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* Narrow screens walk the levels one at a time; the same state drives both. */
+.columnsNarrow {
+  display: grid;
+  gap: 16px;
+}
+
+/* Wide screens show workspaces, task list, and detail side by side. */
+.columnsWide {
+  display: grid;
+  grid-template-columns: minmax(230px, 300px) minmax(300px, 400px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.columnsWide > *,
+.columnsNarrow > * {
+  min-width: 0;
 }
 
 .panel {
@@ -78,7 +109,8 @@
   background: var(--dsw-alias-accent-primary, #63e6cf);
   color: #05231d;
   font-weight: 700;
-  padding: 8px 16px;
+  padding: 12px 16px;
+  min-height: 44px;
   cursor: pointer;
 }
 
@@ -94,7 +126,8 @@
   color: inherit;
   border-radius: 9px;
   cursor: pointer;
-  padding: 7px 12px;
+  padding: 10px 12px;
+  min-height: 44px;
 }
 
 .secondary:disabled {
@@ -173,6 +206,15 @@
   background: rgba(107, 182, 255, 0.11);
 }
 
+.badgeNative {
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: #a8b6c8;
+  background: rgba(168, 182, 200, 0.12);
+}
+
 .badgeContinue {
   font-size: 11px;
   font-weight: 700;
@@ -182,35 +224,117 @@
   background: rgba(96, 205, 137, 0.12);
 }
 
-.continueRadio {
-  align-self: center;
-  width: 16px;
-  height: 16px;
-  accent-color: #60cd89;
+/* ---- Home column: nodes, then the viewed node's workspaces ------------- */
+
+.homeColumn {
+  display: grid;
+  gap: 12px;
+  align-content: start;
 }
 
-.continueCard {
+.columnHead {
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 6px;
-  margin: 12px 0;
-  padding: 12px 14px;
-  border: 1px solid rgba(96, 205, 137, 0.35);
-  border-radius: 11px;
-  background: rgba(96, 205, 137, 0.06);
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 10px;
 }
 
-.continueCard p {
+.columnHead h2 {
   margin: 0;
+  font-size: 14px;
 }
 
-.taskList {
+.columnHead span {
+  color: var(--dsw-alias-label-tertiary, #667286);
+  font-size: 12px;
+}
+
+.columnActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  flex: 0 0 auto;
+}
+
+.nodeSections {
   display: grid;
   gap: 10px;
 }
 
-.wsTaskRow {
+.nodeSection {
+  border: 1px solid var(--dsw-alias-line-border, #283140);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-layer-2, #10161f);
+  padding: 10px 12px;
+}
+
+.nodeToggleButton {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-align: left;
+  padding: 4px 2px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.nodeToggleButton strong {
+  font-size: 14px;
+}
+
+.workspaceList {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.workspaceEntry {
+  display: flex;
+  /* Wraps instead of squeezing: the entry CTA never compresses into
+     char-by-char vertical text beside a long last-activity line. */
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The entry CTA keeps its horizontal label at every width; below 480px it
+   takes its own full row beneath the workspace summary instead. */
+.workspaceEntry .secondary {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.workspaceButton {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  border: 1px solid var(--dsw-alias-line-border, #3a4658);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1, #0c1118);
+  color: inherit;
+  text-align: left;
+  padding: 10px 12px;
+  min-height: 44px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.workspaceButton strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.workspaceButton span {
+  color: var(--dsw-alias-label-tertiary, #667286);
+  font-size: 11px;
+}
+
+.stripRow {
   display: flex;
   align-items: center;
   gap: 14px;
@@ -220,32 +344,74 @@
   background: var(--dsw-alias-bg-layer-2, #10161f);
 }
 
-/* Grid item in the center list, flex item beside the continuation radio. */
-.taskPrimary {
-  flex: 1 1 auto;
-  min-width: 0;
-}
+/* ---- Unified task list column ------------------------------------------ */
 
-.wsGroupHead {
-  margin: 14px 0 6px;
-  font-size: 13px;
-}
-
-.scopeNote {
-  margin: 0 0 10px;
-  color: var(--dsw-alias-label-tertiary, #667286);
-  font-size: 12px;
-}
-
-.taskRow {
+.listColumn {
   display: grid;
-  grid-template-columns: minmax(0, 1.3fr) minmax(220px, 0.9fr) auto;
-  align-items: center;
-  gap: 18px;
-  padding: 15px 16px;
+  gap: 10px;
+  align-content: start;
+}
+
+.backButton {
+  justify-self: start;
+}
+
+.filterBar {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.filterButton {
+  border: 1px solid var(--dsw-alias-line-border, #283140);
+  background: var(--dsw-alias-bg-layer-2, #101620);
+  color: var(--dsw-alias-label-secondary, #93a0b2);
+  border-radius: 999px;
+  padding: 6px 12px;
+  min-height: 36px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.filterActive {
+  border-color: var(--dsw-alias-accent-primary, #63e6cf);
+  background: rgba(99, 230, 207, 0.12);
+  color: var(--dsw-alias-accent-primary, #63e6cf);
+}
+
+.taskList {
+  display: grid;
+  gap: 10px;
+}
+
+.taskRowBtn {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
   border: 1px solid var(--dsw-alias-line-border, #283140);
   border-radius: 13px;
   background: var(--dsw-alias-bg-layer-2, #10161f);
+  color: inherit;
+  padding: 14px 16px;
+  min-height: 44px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.taskRowBtn:hover {
+  border-color: var(--dsw-alias-accent-primary, #63e6cf);
+}
+
+.taskRowBtn:focus-visible {
+  outline: 2px solid var(--dsw-alias-accent-primary, #63e6cf);
+  outline-offset: 1px;
+}
+
+.taskPrimary {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .taskTitleLine {
@@ -255,135 +421,70 @@
   flex-wrap: wrap;
 }
 
+.rowTitle {
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
 .taskTitleLine strong {
   font-size: 14px;
 }
 
 .taskMeta {
-  margin: 4px 0 0;
+  margin: 0;
   color: var(--dsw-alias-label-tertiary, #667286);
   font-size: 12px;
 }
 
-.taskRoute span {
-  display: block;
-  color: var(--dsw-alias-label-tertiary, #667286);
-  font-size: 11px;
-  margin-bottom: 3px;
-}
-
-.taskRoute p {
-  margin: 4px 0 0;
+.rowPreview {
+  margin: 0;
   color: var(--dsw-alias-label-secondary, #93a0b2);
   font-size: 12px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
-.delivery {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-top: 8px;
-}
-
-.delivery span {
-  border-radius: 6px;
-  padding: 2px 6px;
-  font-size: 11px;
-}
-
-.deliveryOk {
-  color: var(--dsw-alias-status-success, #5ce29a);
-  background: rgba(92, 226, 154, 0.08);
-}
-
-.deliveryWaiting {
-  color: var(--dsw-alias-status-warning, #ffc66d);
-  background: rgba(255, 198, 109, 0.08);
-}
-
-.bindingBar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 13px 15px;
-  border: 1px solid rgba(99, 230, 207, 0.28);
-  border-radius: 12px;
-  background: linear-gradient(100deg, rgba(99, 230, 207, 0.08), rgba(16, 21, 29, 0.9) 55%);
-}
-
-.bindingMain {
-  min-width: 0;
-}
-
-.bindingMain strong {
-  display: block;
-  font-size: 14px;
-}
-
-.bindingMain span {
-  color: var(--dsw-alias-label-secondary, #93a0b2);
-  font-size: 12px;
-}
-
-.lockedMark {
-  margin-left: auto;
+.scopeNote {
+  margin: 0 0 6px;
   color: var(--dsw-alias-label-tertiary, #667286);
   font-size: 12px;
 }
 
-.dotOnline,
-.dotOffline {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex: 0 0 auto;
-}
+/* ---- Detail column: result first, run details collapsed ---------------- */
 
-.dotOnline {
-  background: var(--dsw-alias-status-success, #5ce29a);
-}
-
-.dotOffline {
-  background: var(--dsw-alias-status-danger, #ff7a90);
-}
-
-.syncStrip {
+.detailColumn {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  align-content: start;
+}
+
+.detailHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.detailHead h2 {
+  margin: 0 0 6px;
+  font-size: 18px;
+  overflow-wrap: anywhere;
+}
+
+.detailHead p {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary, #93a0b2);
+  font-size: 13px;
+}
+
+.detailActions {
+  display: flex;
   gap: 8px;
-}
-
-.syncStage {
-  border: 1px solid var(--dsw-alias-line-border, #283140);
-  border-radius: 10px;
-  background: var(--dsw-alias-bg-layer-1, #0f151e);
-  padding: 10px 12px;
-}
-
-.syncStage strong {
-  display: block;
-  font-size: 12px;
-}
-
-.syncStage span {
-  display: block;
-  color: var(--dsw-alias-status-success, #5ce29a);
-  font-size: 11px;
-  margin-top: 3px;
-}
-
-.syncWarn {
-  color: var(--dsw-alias-status-warning, #ffc66d) !important;
-}
-
-.runGrid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
-  gap: 14px;
-  align-items: start;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
 }
 
 .conversation {
@@ -391,37 +492,86 @@
   border-radius: 12px;
   background: var(--dsw-alias-bg-layer-2, #10151d);
   padding: 16px;
-  min-height: 220px;
+  min-height: 160px;
 }
 
-.conversation h3,
-.inspector h3 {
+.conversation h3 {
   margin: 0 0 12px;
   font-size: 14px;
 }
 
-.message {
-  display: flex;
-  margin-bottom: 14px;
+.conversation h3 + .conversation h3 {
+  margin-top: 16px;
 }
 
-.messageAssistant {
-  justify-content: flex-start;
+.roundBlock {
+  border-top: 1px dashed var(--dsw-alias-line-border, #283140);
+  padding-top: 12px;
+  margin-top: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.roundHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.roundHead h4 {
+  margin: 0;
+  font-size: 13px;
 }
 
 .bubble {
-  max-width: 82%;
+  max-width: 92%;
   border: 1px solid var(--dsw-alias-line-border, #283140);
   border-radius: 12px;
   padding: 10px 12px;
   background: var(--dsw-alias-bg-layer-3, #151c26);
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+  margin-bottom: 12px;
+}
+
+.bubbleUser {
+  background: rgba(99, 230, 207, 0.05);
+  white-space: pre-wrap;
 }
 
 .bubble p {
   margin: 0;
   font-size: 13px;
+}
+
+.prose {
+  margin: 0 0 8px;
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.prose a {
+  color: var(--dsw-alias-accent-primary, #63e6cf);
+}
+
+.codeBlock {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--dsw-alias-line-border, #283140);
+  border-radius: 9px;
+  background: var(--dsw-alias-bg-layer-1, #0c1118);
+  font-size: 12px;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.inlineCode {
+  border: 1px solid var(--dsw-alias-line-border, #283140);
+  border-radius: 5px;
+  background: var(--dsw-alias-bg-layer-1, #0c1118);
+  padding: 0 4px;
+  font-size: 12px;
 }
 
 .toolCard {
@@ -430,6 +580,8 @@
   padding: 7px 10px;
   background: var(--dsw-alias-bg-layer-1, #0f151e);
   font-size: 12px;
+  margin-bottom: 10px;
+  max-width: 92%;
 }
 
 .toolCard small {
@@ -438,23 +590,44 @@
   margin-top: 2px;
 }
 
-.statusLine {
-  color: var(--dsw-alias-label-tertiary, #667286);
-  font-size: 12px;
-  margin-bottom: 10px;
+.continueBox {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(96, 205, 137, 0.35);
+  border-radius: 12px;
+  background: rgba(96, 205, 137, 0.06);
+  padding: 14px;
 }
 
-.inspector {
+.continueBox h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.runDetails {
   border: 1px solid var(--dsw-alias-line-border, #283140);
   border-radius: 12px;
   background: var(--dsw-alias-bg-layer-2, #10151d);
-  padding: 14px;
+  padding: 12px 14px;
+}
+
+.runDetails summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--dsw-alias-label-secondary, #93a0b2);
+}
+
+.runDetails h4 {
+  margin: 14px 0 6px;
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary, #667286);
 }
 
 .infoList {
   display: grid;
   gap: 10px;
-  margin: 0;
+  margin: 12px 0 0;
 }
 
 .infoItem dt {
@@ -468,34 +641,32 @@
   overflow-wrap: anywhere;
 }
 
-.detailHead {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.detailHead h2 {
-  margin: 0 0 4px;
-  font-size: 18px;
-}
-
-.detailHead p {
+.statusTrace {
   margin: 0;
-  color: var(--dsw-alias-label-secondary, #93a0b2);
-  font-size: 13px;
+  padding-left: 18px;
+  color: var(--dsw-alias-label-tertiary, #667286);
+  font-size: 12px;
 }
 
-.detailActions {
-  display: flex;
-  gap: 8px;
-  flex: 0 0 auto;
+.statusTrace li {
+  margin-bottom: 3px;
 }
+
+/* ---- Composition -------------------------------------------------------- */
 
 .targetGrid {
   display: grid;
   grid-template-columns: 1.2fr 1fr;
   gap: 12px;
+}
+
+.presetTarget {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--dsw-alias-line-border, #283140);
+  border-radius: 11px;
+  background: var(--dsw-alias-bg-layer-2, #10161f);
+  padding: 12px 14px;
 }
 
 .field {
@@ -519,7 +690,7 @@
   background: var(--dsw-alias-bg-layer-1, #0c1118);
   color: inherit;
   border-radius: 9px;
-  padding: 8px 10px;
+  padding: 9px 10px;
   font: inherit;
 }
 
@@ -528,7 +699,7 @@
 }
 
 .composer {
-  margin-top: 14px;
+  margin-top: 6px;
   display: grid;
   gap: 12px;
 }
@@ -546,6 +717,8 @@
   color: var(--dsw-alias-status-warning, #ffc66d);
   font-size: 13px;
 }
+
+/* ---- Node settings ------------------------------------------------------ */
 
 .nodeList {
   display: grid;
@@ -612,14 +785,41 @@
   border-radius: 11px;
   background: var(--dsw-alias-bg-layer-2, #10161f);
   font-size: 13px;
+  flex-wrap: wrap;
 }
 
 @media (max-width: 900px) {
-  .taskRow,
-  .runGrid,
-  .targetGrid,
-  .editorGrid,
-  .syncStrip {
+  .columnsWide {
     grid-template-columns: 1fr;
+  }
+
+  .targetGrid,
+  .editorGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 480px) {
+  /* Phone header: title block and CTA each take a full row — the CTA keeps
+     its horizontal label and a >=44px touch target at 320px and 390px even
+     when the DSH outer sidebar consumes part of the viewport. */
+  .pageHead > div {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
+  .pageHead .primary {
+    flex: 1 1 100%;
+  }
+
+  /* Phone workspace card: the summary button and the CTA stack full-row —
+     the CTA stays horizontal and >=44px, the workspace label and meta stay
+     fully visible, and nothing overflows horizontally. */
+  .workspaceEntry .workspaceButton {
+    flex: 1 1 100%;
+  }
+
+  .workspaceEntry .secondary {
+    flex: 1 1 100%;
   }
 }

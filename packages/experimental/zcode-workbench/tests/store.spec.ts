@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -59,6 +59,123 @@ describe('workbench task store', () => {
     await store.transition(record.workbenchTaskId, 'completed')
     await store.transition(record.workbenchTaskId, 'reported')
     expect(store.get(record.workbenchTaskId)?.status).toBe('reported')
+  })
+
+  it('keeps the real outcome through the reported marking for every terminal result', async () => {
+    for (const outcome of ['completed', 'failed', 'cancelled'] as const) {
+      const dir = await mkdtemp(join(tmpdir(), 'dsh-zcode-outcome-'))
+      directories.push(dir)
+      const store = new TaskStore(dir, 200)
+      await store.load()
+      const { record } = await store.create({ source: 'workbench', sourceTaskId: null, threadId: null, title: 't', prompt: 'p', now })
+      await store.transition(record.workbenchTaskId, 'awaiting_route')
+      await store.transition(record.workbenchTaskId, 'dispatching')
+      await store.transition(record.workbenchTaskId, 'zcode_acknowledged')
+      await store.transition(record.workbenchTaskId, 'running')
+      await store.transition(record.workbenchTaskId, outcome)
+      expect(store.get(record.workbenchTaskId)?.terminalOutcome).toBe(outcome)
+      // The reported marking must never overwrite the recorded outcome.
+      await store.transition(record.workbenchTaskId, 'reported')
+      const reported = store.get(record.workbenchTaskId)
+      expect(reported?.status).toBe('reported')
+      expect(reported?.terminalOutcome).toBe(outcome)
+      // And it survives persistence: reopening the file keeps the outcome.
+      const reopened = new TaskStore(dir, 200)
+      await reopened.load()
+      expect(reopened.get(record.workbenchTaskId)).toMatchObject({ status: 'reported', terminalOutcome: outcome })
+    }
+  }, 30_000)
+
+  it('settles the outcome again after a pre-send retry re-enters dispatch', async () => {
+    const store = await freshStore()
+    const { record } = await store.create({ source: 'workbench', sourceTaskId: null, threadId: null, title: 't', prompt: 'p', now })
+    await store.transition(record.workbenchTaskId, 'dispatching')
+    await store.transition(record.workbenchTaskId, 'failed')
+    expect(store.get(record.workbenchTaskId)?.terminalOutcome).toBe('failed')
+    // Retry under the same id: the record leaves its terminal state.
+    await store.transition(record.workbenchTaskId, 'dispatching')
+    expect(store.get(record.workbenchTaskId)?.terminalOutcome).toBeNull()
+    await store.transition(record.workbenchTaskId, 'zcode_acknowledged')
+    await store.transition(record.workbenchTaskId, 'running')
+    await store.transition(record.workbenchTaskId, 'completed')
+    await store.transition(record.workbenchTaskId, 'reported')
+    expect(store.get(record.workbenchTaskId)?.terminalOutcome).toBe('completed')
+  })
+
+  it('recovers legacy outcomes from the durable status trace on load', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-zcode-legacy-'))
+    directories.push(dir)
+    const base = {
+      v: 1,
+      tasks: [{
+        workbenchTaskId: 'WB-20260920-001',
+        source: 'codex',
+        sourceTaskId: 'legacy-1',
+        threadId: null,
+        title: 'legacy',
+        prompt: 'p',
+        status: 'reported',
+        nodeId: 'n',
+        nodeLabel: 'n',
+        workspacePath: '/w',
+        workspaceLabel: 'w',
+        acpSessionId: 's',
+        desktopTaskId: null,
+        promptSentAt: '2026-09-20T00:00:01.000Z',
+        awaitingInput: false,
+        echoLost: false,
+        lastError: null,
+        transcript: [
+          { at: '2026-09-20T00:00:00.000Z', kind: 'status', text: 'received', key: null, toolStatus: null },
+          { at: '2026-09-20T00:00:01.000Z', kind: 'status', text: 'dispatching', key: null, toolStatus: null },
+          { at: '2026-09-20T00:00:02.000Z', kind: 'status', text: 'running', key: null, toolStatus: null },
+          { at: '2026-09-20T00:00:03.000Z', kind: 'status', text: 'failed', key: null, toolStatus: null },
+          { at: '2026-09-20T00:00:04.000Z', kind: 'status', text: 'reported', key: null, toolStatus: null },
+        ],
+        createdAt: '2026-09-20T00:00:00.000Z',
+        updatedAt: '2026-09-20T00:00:04.000Z',
+      }],
+    }
+    await writeFile(join(dir, 'tasks.json'), `${JSON.stringify(base, null, 2)}\n`, 'utf8')
+    const store = new TaskStore(dir, 200)
+    await store.load()
+    // The pre-field reported record recovers `failed` from its status trace
+    // instead of reading as a success — or as an unrecoverable null.
+    expect(store.get('WB-20260920-001')?.terminalOutcome).toBe('failed')
+  })
+
+  it('leaves unrecoverable legacy outcomes null (result needs verification)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-zcode-legacy2-'))
+    directories.push(dir)
+    const base = {
+      v: 1,
+      tasks: [{
+        workbenchTaskId: 'WB-20260920-002',
+        source: 'codex',
+        sourceTaskId: 'legacy-2',
+        threadId: null,
+        title: 'legacy',
+        prompt: 'p',
+        status: 'reported',
+        nodeId: 'n',
+        nodeLabel: 'n',
+        workspacePath: '/w',
+        workspaceLabel: 'w',
+        acpSessionId: 's',
+        desktopTaskId: null,
+        promptSentAt: '2026-09-20T00:00:01.000Z',
+        awaitingInput: false,
+        echoLost: false,
+        lastError: null,
+        transcript: [{ at: '2026-09-20T00:00:04.000Z', kind: 'status', text: 'reported', key: null, toolStatus: null }],
+        createdAt: '2026-09-20T00:00:00.000Z',
+        updatedAt: '2026-09-20T00:00:04.000Z',
+      }],
+    }
+    await writeFile(join(dir, 'tasks.json'), `${JSON.stringify(base, null, 2)}\n`, 'utf8')
+    const store = new TaskStore(dir, 200)
+    await store.load()
+    expect(store.get('WB-20260920-002')?.terminalOutcome).toBeNull()
   })
 
   it('persists atomically and reloads from disk', async () => {

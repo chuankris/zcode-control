@@ -3153,6 +3153,317 @@ test("session/adopt workspace rules: session mode requires the path, fixed mode 
   }
 });
 
+// ---------- --task-snapshot: one read-only conversation snapshot ----------
+
+/** Parses the single `[adapter] task-snapshot: <json>` stdout line. */
+function parseSnapshotLine(out) {
+  const line = out.split("\n").map((part) => part.trim()).find((part) => part.includes("] task-snapshot: "));
+  assert.ok(line, "a task-snapshot line must be printed");
+  return JSON.parse(line.slice(line.indexOf("] task-snapshot: ") + "] task-snapshot: ".length));
+}
+
+/** The adapter's summary row cap; tests exercise the boundary itself. */
+const SNAPSHOT_ROW_CAP = 200;
+
+
+/** A fixed-mode task list naming one completed native task in the pinned workspace. */
+const SNAPSHOT_TASK_LIST = fixedTaskList([
+  { taskId: DESKTOP_SESSION, title: "native task to read", status: "completed", createdAt: 1730000000000, updatedAt: 1730000500000 },
+  { taskId: "dtask-snap-2", title: "still running", status: "running", createdAt: 1730001000000, updatedAt: 1730001500000 },
+])
+
+test("--task-snapshot reads one conversation read-only: ordered, scrubbed, bounded, never a command", async () => {
+  const sc = scenario();
+  try {
+    const snapshot = buildSnapshot(6, {
+      phase: "completedSuccess",
+      rows: [
+        userRow(0, "please summarize https://relay.example/secret"),
+        toolRow(1, "tool-1", "success", { inputText: "ls" }),
+        assistantRow(2, "see https://relay.example/x for details"),
+        assistantRow(3, "second answer block"),
+      ],
+    });
+    const env = fakeEnv(sc, {
+      script: { subscribeFrames: [snapWire(6, {})] },
+      taskList: SNAPSHOT_TASK_LIST,
+    });
+    // The scripted snapshot above needs the exact rows: rebuild the wire with
+    // the crafted snapshot (snapWire's opts build covers phase/rows already).
+    writeFileSync(sc.scriptFile, JSON.stringify({
+      subscribeFrames: [wireFrame(0, 6, { kind: "snapshot", snapshot })],
+    }));
+    const result = await runAdapterOnce(["--config", sc.configFile, "--task-snapshot", DESKTOP_SESSION], env);
+    assert.equal(result.code, 0);
+    const report = parseSnapshotLine(result.out);
+    assert.equal(report.taskId, DESKTOP_SESSION);
+    assert.equal(report.phase, "completedSuccess");
+    assert.equal(report.reason, null);
+    assert.equal(report.rowCount, 4);
+    // totalCount covers the window: the report does not claim truncation.
+    assert.equal(report.partial, false);
+    assert.deepEqual(
+      report.summary.map((entry) => [entry.kind, entry.rowId]),
+      [["user", 0], ["tool", 1], ["assistant", 2], ["assistant", 3]],
+    );
+    assert.match(report.summary[0].text, /please summarize \[url\]/);
+    assert.equal(report.summary[2].text, "see [url] for details");
+    assert.equal(report.summary[1].toolCallId, "tool-1");
+    assert.equal(report.summary[1].title, "Bash");
+    assert.equal(report.summary[1].status, "completed");
+    // Read-only contract: identity check then hello/initialize/subscribe —
+    // never a conversation command, never an adoption, never a created task.
+    const calls = journalCalls(sc);
+    assert.ok(calls.some((call) => call.channel === "zcode-task" && call.name === "listTasks"));
+    assert.ok(calls.some((call) => call.channel === "zcode-agent" && call.name === "subscribeConversationV4"));
+    assert.equal(
+      calls.filter((call) => call.channel === "zcode-agent" && call.name === "sendConversationCommandV4").length,
+      0,
+      "the snapshot pass must never send a conversation command",
+    );
+    assert.equal(readJournal(sc).filter((entry) => entry.kind === "connect").length, 1, "one controller pairing");
+    assertNoSecrets(result.out + result.err);
+  } finally {
+    await cleanup(sc);
+  }
+});
+
+test("--task-snapshot flags a tail window as partial instead of faking full history", async () => {
+  const sc = scenario();
+  try {
+    const window = [userRow(4, "late question"), assistantRow(5, "late answer")];
+    const truncated = {
+      ...buildSnapshot(9, { phase: "completedSuccess", rows: window }),
+      rows: { window, totalCount: 6, firstRowId: 4 },
+    };
+    const env = fakeEnv(sc, {
+      script: { subscribeFrames: [wireFrame(0, 9, { kind: "snapshot", snapshot: truncated })] },
+      taskList: SNAPSHOT_TASK_LIST,
+    });
+    const result = await runAdapterOnce(["--config", sc.configFile, "--task-snapshot", DESKTOP_SESSION], env);
+    assert.equal(result.code, 0);
+    const report = parseSnapshotLine(result.out);
+    assert.equal(report.partial, true, "window shorter than totalCount must read as recent-only");
+    assert.equal(report.rowCount, 2);
+  } finally {
+    await cleanup(sc);
+  }
+});
+
+test("--task-snapshot refuses a task the bridged workspace's index does not carry", async () => {
+  const sc = scenario();
+  try {
+    const env = fakeEnv(sc, {
+      script: { subscribeFrames: [snapWire(1, {})] },
+      taskList: SNAPSHOT_TASK_LIST,
+    });
+    const result = await runAdapterOnce(["--config", sc.configFile, "--task-snapshot", "dtask-elsewhere"], env);
+    assert.equal(result.code, 1);
+    const report = parseSnapshotLine(result.out);
+    assert.equal(report.reason, "task-missing");
+    assert.equal(report.summary, null);
+    // Identity refused before any subscription: nothing was read.
+    const calls = journalCalls(sc);
+    assert.ok(calls.some((call) => call.channel === "zcode-task" && call.name === "listTasks"));
+    assert.equal(calls.filter((call) => call.channel === "zcode-agent").length, 0, "no conversation handshake for a missing task");
+  } finally {
+    await cleanup(sc);
+  }
+});
+
+test("--task-snapshot isolates workspaces in session mode", async () => {
+  const sc = siteScenario();
+  try {
+    const taskList = {
+      "site-wid-a": [
+        { taskId: "dtask-site-snap", title: "workspace A task", status: "completed", createdAt: 1, updatedAt: 1730000500000 },
+      ],
+    };
+    const env = fakeEnv(sc, { bootstrap: SITE_BOOTSTRAP, taskList });
+    // The same task id asked through workspace B's listing: not found there.
+    const wrong = await runAdapterOnce(
+      ["--config", sc.configFile, "--task-snapshot", "dtask-site-snap", "D:\\site-ws-b"],
+      env,
+    );
+    assert.equal(wrong.code, 1);
+    assert.equal(parseSnapshotLine(wrong.out).reason, "task-missing");
+    // Through its own workspace it reads.
+    const siteTopic = (wire) => ({
+      ...wire,
+      topic: "conversation/dtask-site-snap",
+      frame: { ...wire.frame, topic: "conversation/dtask-site-snap" },
+    });
+    writeFileSync(sc.scriptFile, JSON.stringify({
+      subscribeFrames: [siteTopic(snapWire(3, { phase: "completedSuccess", rows: [userRow(0, "q"), assistantRow(1, "a")] }))],
+    }));
+    const right = await runAdapterOnce(
+      ["--config", sc.configFile, "--task-snapshot", "dtask-site-snap", "D:\\site-ws-a"],
+      fakeEnv(sc, { bootstrap: SITE_BOOTSTRAP, taskList }),
+    );
+    assert.equal(right.code, 0);
+    const report = parseSnapshotLine(right.out);
+    assert.equal(report.reason, null);
+    assert.deepEqual(report.summary.map((entry) => entry.kind), ["user", "assistant"]);
+  } finally {
+    await cleanup(sc);
+  }
+});
+
+test("--task-snapshot reports under a fully closed stdin: the referenced deadline owns the read", async () => {
+  // runAdapterOnce spawns with stdin ignored: no parent handle keeps the
+  // child's loop alive. The mode's own referenced hard deadline must keep the
+  // bounded read alive and still print exactly one report line (here the
+  // inner snapshot budget refuses first; the deadline is the backstop).
+  const sc = scenario({ requestTimeoutMs: 1000 });
+  try {
+    const result = await runAdapterOnce(
+      ["--config", sc.configFile, "--task-snapshot", DESKTOP_SESSION],
+      fakeEnv(sc, { taskList: SNAPSHOT_TASK_LIST }),
+    );
+    assert.equal(result.code, 1);
+    assert.equal(parseSnapshotLine(result.out).reason, "snapshot-unreadable");
+    assert.match(result.err, /unavailable \(snapshot-unreadable\)/);
+    assertNoSecrets(result.out + result.err);
+  } finally {
+    await cleanup(sc);
+  }
+});
+
+test("--task-snapshot failure and argv validation modes", async () => {
+  const sc = scenario();
+  try {
+    // No subscribe frames scripted: the wait for a snapshot times out and the
+    // pass reports snapshot-unreadable without inventing content.
+    const unreadable = await runAdapterOnce(
+      ["--config", sc.configFile, "--task-snapshot", DESKTOP_SESSION],
+      fakeEnv(sc, { taskList: SNAPSHOT_TASK_LIST }),
+    );
+    assert.equal(unreadable.code, 1);
+    assert.equal(parseSnapshotLine(unreadable.out).reason, "snapshot-unreadable");
+  } finally {
+    await cleanup(sc);
+  }
+
+  const site = siteScenario();
+  try {
+    // Session mode without a path fails before any connection.
+    const noPath = await runAdapterOnce(
+      ["--config", site.configFile, "--task-snapshot", "dtask-1"],
+      fakeEnv(site, { bootstrap: SITE_BOOTSTRAP }),
+    );
+    assert.equal(noPath.code, 2);
+    assert.match(noPath.err, /requires a workspace path/);
+  } finally {
+    await cleanup(site);
+  }
+
+  const sc2 = scenario();
+  try {
+    // Fixed mode takes no path, and the mode is exclusive with --list-tasks.
+    const withPath = await runAdapterOnce(
+      ["--config", sc2.configFile, "--task-snapshot", "dtask-1", "D:\\fake-ws"],
+      fakeEnv(sc2, { taskList: SNAPSHOT_TASK_LIST }),
+    );
+    assert.equal(withPath.code, 2);
+    assert.match(withPath.err, /takes no workspace path/);
+    const exclusive = await runAdapterOnce(
+      ["--config", sc2.configFile, "--task-snapshot", "dtask-1", "--list-tasks"],
+      fakeEnv(sc2, { taskList: SNAPSHOT_TASK_LIST }),
+    );
+    assert.equal(exclusive.code, 2);
+    assert.match(exclusive.err, /exclusive/);
+  } finally {
+    await cleanup(sc2);
+  }
+});
+
+test("--task-snapshot projects only user-authored inputs, never engine-sourced rows", async () => {
+  const sc = scenario();
+  try {
+    const rows = [
+      userRow(0, "real user question"),
+      // Engine-sourced input rows: neither realUser origin nor guided — the
+      // snapshot must not present them as conversation turns.
+      row(1, { kind: "userInput", text: "engine-internal instruction", origin: "engine" }),
+      row(2, { kind: "userInput", text: "queued host instruction" }),
+      row(3, { kind: "userInput", text: "guided follow-up", origin: "system", guided: true }),
+      assistantRow(4, "answer"),
+    ];
+    const env = fakeEnv(sc, {
+      script: { subscribeFrames: [wireFrame(0, 7, { kind: "snapshot", snapshot: buildSnapshot(7, { phase: "completedSuccess", rows }) })] },
+      taskList: SNAPSHOT_TASK_LIST,
+    });
+    const result = await runAdapterOnce(["--config", sc.configFile, "--task-snapshot", DESKTOP_SESSION], env);
+    assert.equal(result.code, 0);
+    const report = parseSnapshotLine(result.out);
+    const userTexts = report.summary.filter((entry) => entry.kind === "user").map((entry) => entry.text);
+    assert.deepEqual(userTexts, ["real user question", "guided follow-up"]);
+    // The rowCount still reports every window row; only the summary filters.
+    assert.equal(report.rowCount, 5);
+  } finally {
+    await cleanup(sc);
+  }
+});
+
+test("--task-snapshot keeps the NEWEST rows when the cap truncates, still ascending, still partial", async () => {
+  const sc = scenario();
+  try {
+    // A complete window (totalCount === window length) whose summary alone
+    // exceeds the cap: recent-only by definition, never full history — and
+    // the rows that survive are the newest ones, latest answer included.
+    const rows = [];
+    for (let index = 0; index < SNAPSHOT_ROW_CAP; index += 1) {
+      rows.push(userRow(index, `turn ${index}`));
+    }
+    rows.push(assistantRow(SNAPSHOT_ROW_CAP, "the latest answer that must survive"));
+    const env = fakeEnv(sc, {
+      script: { subscribeFrames: [wireFrame(0, rows.length, { kind: "snapshot", snapshot: buildSnapshot(rows.length, { phase: "completedSuccess", rows }) })] },
+      taskList: SNAPSHOT_TASK_LIST,
+    });
+    const result = await runAdapterOnce(["--config", sc.configFile, "--task-snapshot", DESKTOP_SESSION], env);
+    assert.equal(result.code, 0);
+    const report = parseSnapshotLine(result.out);
+    assert.equal(report.summary.length, SNAPSHOT_ROW_CAP);
+    assert.equal(report.rowCount, rows.length);
+    assert.equal(report.partial, true, "a capped summary must read as recent-only even when the window is complete");
+    // The newest 200 of the 201 projectable rows survive, in ascending order,
+    // ending on the latest assistant reply; the oldest user turn fell off.
+    const last = report.summary[report.summary.length - 1];
+    assert.equal(last.kind, "assistant");
+    assert.equal(last.text, "the latest answer that must survive");
+    assert.equal(report.summary[0].text, "turn 1");
+    for (let index = 1; index < report.summary.length; index += 1) {
+      assert.ok(report.summary[index].rowId > report.summary[index - 1].rowId, "display order stays ascending");
+    }
+  } finally {
+    await cleanup(sc);
+  }
+});
+
+test("--task-snapshot scrubs credentials before capping so a straddling secret never leaks a fragment", async () => {
+  const sc = scenario();
+  try {
+    // The secret starts six characters before the 16 KiB cap: slicing first
+    // would keep a five-character fragment no redaction can match anymore.
+    const pad = "a".repeat(16_384 - 6);
+    const rows = [row(0, { kind: "userInput", text: `${pad}SECRETSID42-tail`, origin: "realUser" })];
+    const env = fakeEnv(sc, {
+      script: { subscribeFrames: [wireFrame(0, 1, { kind: "snapshot", snapshot: buildSnapshot(1, { phase: "completedSuccess", rows }) })] },
+      taskList: SNAPSHOT_TASK_LIST,
+    });
+    const result = await runAdapterOnce(["--config", sc.configFile, "--task-snapshot", DESKTOP_SESSION], env);
+    assert.equal(result.code, 0);
+    const report = parseSnapshotLine(result.out);
+    const text = report.summary[0].text;
+    assert.ok(!text.includes("SECRE"), "no secret fragment survives the cap boundary");
+    assert.ok(!/\[[^\[\]]{0,9}$/.test(text), "no half-written redaction marker is shown");
+    assert.ok(text.length <= 16_384 && text.length >= 16_384 - 10, "the cap holds within one marker of its bound");
+    assertNoSecrets(result.out + result.err);
+  } finally {
+    await cleanup(sc);
+  }
+});
+
 // ---------- --reconcile-dispatch: verify-then-release an unresolved dispatch ----------
 //
 // The desktop protocol cannot prove non-application after a lost ack, so the

@@ -190,6 +190,30 @@ if (reconcileMode) {
 }
 if (healthMode && listTasksMode) fail(2, "--health and --list-tasks are exclusive");
 if ((healthMode || listTasksMode) && reconcileMode) fail(2, "--reconcile-dispatch is exclusive with --health and --list-tasks");
+// `--task-snapshot <taskId> [<workspacePath>]`: one read-only conversation
+// snapshot of an existing desktop task (the native-task detail entry). The
+// path rules mirror --list-tasks and --reconcile-dispatch: session mode
+// requires it, fixed mode refuses it.
+const taskSnapshotArgIdx = process.argv.indexOf("--task-snapshot");
+const taskSnapshotMode = taskSnapshotArgIdx !== -1;
+let snapshotTaskId = null;
+let snapshotWorkspace = null;
+if (taskSnapshotMode) {
+  const operands = [];
+  for (let index = taskSnapshotArgIdx + 1; index < process.argv.length; index += 1) {
+    const arg = process.argv[index];
+    if (arg.startsWith("-") && arg !== "-") break;
+    operands.push(arg);
+  }
+  if (operands.length < 1 || operands.length > 2) {
+    fail(2, "--task-snapshot takes a taskId and an optional workspace path");
+  }
+  snapshotTaskId = operands[0];
+  snapshotWorkspace = operands[1] ?? null;
+}
+if (taskSnapshotMode && (healthMode || listTasksMode || reconcileMode)) {
+  fail(2, "--task-snapshot is exclusive with --health, --list-tasks, and --reconcile-dispatch");
+}
 let configRaw;
 try {
   configRaw = readFileSync(configPath, "utf8");
@@ -228,6 +252,17 @@ if (reconcileMode) {
   }
   if (!SESSION_WORKSPACES && reconcileWorkspace !== null) {
     fail(2, "--reconcile-dispatch takes no workspace path; the workspace is pinned in this configuration");
+  }
+}
+if (taskSnapshotMode) {
+  if (typeof snapshotTaskId !== "string" || snapshotTaskId.length === 0 || snapshotTaskId.length > 200) {
+    fail(2, "--task-snapshot requires a taskId of 1..200 characters");
+  }
+  if (SESSION_WORKSPACES && snapshotWorkspace === null) {
+    fail(2, "--task-snapshot requires a workspace path when workspaceSelection is session");
+  }
+  if (!SESSION_WORKSPACES && snapshotWorkspace !== null) {
+    fail(2, "--task-snapshot takes no workspace path; the workspace is pinned in this configuration");
   }
 }
 if (SESSION_WORKSPACES && configFile.workspace !== undefined && configFile.workspace !== null) {
@@ -1104,6 +1139,10 @@ class ConversationProjection {
     this.pendingInteractions = [];
     this.lastError = null;
     this.inputRouting = null;
+    // Official snapshot rows carry a totalCount next to the window; a window
+    // shorter than it is a truncated tail. Null when the snapshot omitted it
+    // (then completeness simply cannot be claimed).
+    this.totalRowCount = null;
   }
 
   get terminal() {
@@ -1129,6 +1168,9 @@ class ConversationProjection {
       this.lastError = snapshot.control?.lastError ?? null;
       this.inputRouting = snapshot.inputRouting ?? null;
       this.pendingInteractions = Array.isArray(snapshot.pendingInteractions) ? snapshot.pendingInteractions : [];
+      this.totalRowCount = typeof snapshot.rows?.totalCount === "number" && Number.isFinite(snapshot.rows.totalCount)
+        ? snapshot.rows.totalCount
+        : null;
       const changed = [];
       for (const row of window) {
         if (!validRow(row)) return { gap: true };
@@ -2213,6 +2255,182 @@ if (listTasksMode) {
   } catch (error) {
     process.stderr.write(`[${ADAPTER_NAME}] tasks: ${siteName} task listing failed (${error instanceof LinkError ? error.message : error instanceof Error ? scrub(error.message) : "unknown"})\n`);
     process.exitCode = 1;
+  }
+  // Same deferred exit as --health: never unwind the module graph synchronously.
+  setImmediate(() => process.exit(process.exitCode ?? 1));
+}
+
+// ---------- --task-snapshot: one read-only conversation snapshot ----------
+
+/** Upper bound on summary entries one snapshot reports. */
+const TASK_SNAPSHOT_ROW_CAP = 200;
+/** Per-entry text cap, applied after credential/URL scrubbing. */
+const TASK_SNAPSHOT_TEXT_CAP = 16_384;
+/** Tool-title cap per entry, applied after scrubbing. */
+const TASK_SNAPSHOT_TITLE_CAP = 200;
+
+/**
+ * Scrub first, cap second: a secret straddling the cap boundary is redacted
+ * whole, never truncated into a leaking fragment. When the cap then lands
+ * inside a replacement marker, the dangling partial marker is trimmed rather
+ * than shown half-written.
+ */
+function scrubCapped(text) {
+  const scrubbed = scrub(text);
+  if (scrubbed.length <= TASK_SNAPSHOT_TEXT_CAP) return scrubbed;
+  return scrubbed.slice(0, TASK_SNAPSHOT_TEXT_CAP).replace(/\[[^\[\]]{0,9}$/, "");
+}
+
+/** The task-snapshot report's fixed marker prefix on stdout (one JSON line). */
+const TASK_SNAPSHOT_LINE_MARKER = "] task-snapshot: ";
+
+/**
+ * Projects one live conversation projection into a bounded, ordered, scrubbed
+ * summary for the workbench's native-task detail. Rows project in row order:
+ * user and assistant text rows carry their (scrubbed, capped) text, tool rows
+ * carry the compact card facts, and `reasoning` rows or unknown kinds are
+ * never projected — nothing is guessed at. User rows count only when the
+ * desktop itself marks them user-authored (`origin: realUser` or `guided`) —
+ * engine-sourced input rows are not conversation turns. Text is scrubbed
+ * BEFORE capping so a secret straddling the cap boundary is redacted whole,
+ * never truncated into a leaking fragment. When more than the row cap is
+ * projectable, the NEWEST rows are kept — a task detail's value is the
+ * recent conversation, and the latest answer must never fall off — while the
+ * display order stays ascending by rowId. `truncated` reports whether the cap
+ * cut the summary short (the caller must then flag partial).
+ */
+function projectConversationSummary(projection) {
+  const ordered = [...projection.rows.values()].sort((a, b) => a.rowId - b.rowId);
+  const entries = [];
+  for (const row of ordered) {
+    if (row.kind === "userInput" && typeof row.text === "string" && (row.origin === "realUser" || row.guided === true)) {
+      entries.push({ kind: "user", rowId: row.rowId, text: scrubCapped(row.text) });
+      continue;
+    }
+    if (row.kind === "assistantText" && typeof row.text === "string") {
+      entries.push({ kind: "assistant", rowId: row.rowId, text: scrubCapped(row.text) });
+      continue;
+    }
+    if (row.kind === "toolCall" && typeof row.toolCallId === "string" && row.toolCallId.length > 0) {
+      entries.push({
+        kind: "tool",
+        rowId: row.rowId,
+        toolCallId: row.toolCallId,
+        title: typeof row.toolName === "string" && row.toolName.length > 0
+          ? scrub(row.toolName).slice(0, TASK_SNAPSHOT_TITLE_CAP)
+          : "tool",
+        status: TOOL_ROW_STATUS_TO_ACP[row.status] ?? "pending",
+      });
+    }
+  }
+  const truncated = entries.length > TASK_SNAPSHOT_ROW_CAP;
+  return {
+    summary: truncated ? entries.slice(entries.length - TASK_SNAPSHOT_ROW_CAP) : entries,
+    truncated,
+  };
+}
+
+/**
+ * Runs one read-only snapshot pass over an existing desktop task and returns
+ * its report object. Identity is verified first — the full task id must be
+ * visible in the bridged workspace's own synced index — and the conversation
+ * is then read through the official subscription path (hello, initialize,
+ * subscribe, snapshot, unsubscribe). The pass never adopts a binding, never
+ * creates a session or task, and never sends a conversation command; every
+ * refusal is a machine-stable `reason` with no state change.
+ * @returns {Promise<object>} the report; the caller prints it as one stdout line.
+ */
+async function runTaskSnapshot() {
+  const targetNorm = SESSION_WORKSPACES ? normalizeWorkspacePath(snapshotWorkspace) : WORKSPACE_NORM;
+  const report = {
+    taskId: snapshotTaskId,
+    phase: null,
+    pendingInteractions: null,
+    // A tail window never masquerades as full history: partial stays true
+    // unless the snapshot's own totalCount proves the window covers every row.
+    partial: true,
+    rowCount: null,
+    sampledAt: new Date().toISOString(),
+    summary: null,
+    reason: null,
+  };
+  const refuse = (reason) => ({ ...report, reason });
+
+  let metas;
+  try {
+    await link.ensure(SESSION_WORKSPACES ? targetNorm : undefined);
+    metas = await link.bridge.call("zcode-task", "listTasks", [link.workspaceTarget()]);
+  } catch {
+    return refuse("index-unreadable");
+  }
+  const meta = Array.isArray(metas)
+    ? metas.find((entry) => typeof entry === "object" && entry !== null && entry.taskId === snapshotTaskId)
+    : undefined;
+  if (meta === undefined) return refuse("task-missing");
+
+  const stream = new ConversationStream(snapshotTaskId);
+  try {
+    try {
+      await stream.attach();
+      await stream.waitForSnapshot(config.requestTimeoutMs);
+    } catch {
+      return refuse("snapshot-unreadable");
+    }
+    const projection = stream.projection;
+    const projected = projectConversationSummary(projection);
+    return {
+      ...report,
+      phase: projection.phase,
+      pendingInteractions: projection.pendingInteractions.length,
+      // Partial when the window cannot prove completeness OR the summary cap
+      // cut it short: a capped summary is recent-only content by definition.
+      partial: projection.totalRowCount === null
+        || projection.rows.size < projection.totalRowCount
+        || projected.truncated,
+      rowCount: projection.rows.size,
+      summary: projected.summary,
+    };
+  } finally {
+    await stream.dispose();
+  }
+}
+
+if (taskSnapshotMode) {
+  // One-shot CLI semantics: the stream's inner waits use unref'd timers by
+  // design, and the caller may close stdin — nothing else would hold the
+  // event loop. One REFERENCED hard deadline bounds the whole pass and
+  // guarantees exactly one report line on every path: success, refusal, or
+  // the deadline itself (snapshot-unreadable), even if an inner await never
+  // settles. The mode is therefore self-sufficient under a closed stdin.
+  const deadlineMs = Math.max(30_000, config.requestTimeoutMs * 2 + 5_000);
+  let settleDeadline = () => {};
+  const deadline = new Promise((resolve) => {
+    // Referenced on purpose (no .unref()): this timer keeps the loop alive
+    // for the bounded read and is cleared on every settling path below.
+    const timer = setTimeout(() => resolve({ taskId: snapshotTaskId, reason: "snapshot-unreadable", hardDeadline: true }), deadlineMs);
+    settleDeadline = () => clearTimeout(timer);
+  });
+  let report;
+  try {
+    report = await Promise.race([runTaskSnapshot(), deadline]);
+    if (report?.hardDeadline === true) {
+      delete report.hardDeadline;
+      process.stderr.write(`[${ADAPTER_NAME}] task-snapshot: the read did not settle within ${deadlineMs}ms\n`);
+    }
+  } catch (error) {
+    // An internal defect is never a desktop verdict; nothing was read that
+    // could be reported, and the fixed-string reason says so.
+    report = { taskId: snapshotTaskId, reason: "internal-error" };
+    process.stderr.write(`[${ADAPTER_NAME}] task-snapshot: failed (${error instanceof Error ? error.name : "unknown"})\n`);
+  }
+  settleDeadline();
+  link.dispose();
+  process.stdout.write(`[${ADAPTER_NAME}] task-snapshot: ${JSON.stringify(report)}\n`);
+  if (report.reason !== null) {
+    process.stderr.write(`[${ADAPTER_NAME}] task-snapshot: unavailable (${report.reason})\n`);
+    process.exitCode = 1;
+  } else {
+    process.exitCode = 0;
   }
   // Same deferred exit as --health: never unwind the module graph synchronously.
   setImmediate(() => process.exit(process.exitCode ?? 1));

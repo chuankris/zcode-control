@@ -5,7 +5,7 @@
  * the same chain.
  */
 import type {
-  TerminalWorkbenchTaskStatus, WorkbenchTaskSource, WorkbenchTaskStatus,
+  TerminalWorkbenchTaskStatus, WorkbenchTaskSource, WorkbenchTaskStatus, WorkbenchTerminalOutcome,
   WorkbenchTaskView, WorkbenchTranscriptEvent, ZcodeDeliveryState,
 } from './types.ts'
 
@@ -18,6 +18,13 @@ export interface WorkbenchTaskRecord {
   title: string
   prompt: string
   status: WorkbenchTaskStatus
+  /**
+   * Terminal outcome the record settled into before any `reported` marking.
+   * `reported` rewrites `status` but never this field, so the real result
+   * survives the report acknowledgment. Cleared when a retry re-enters
+   * dispatch; recovered from the status trace for legacy records on load.
+   */
+  terminalOutcome: WorkbenchTerminalOutcome
   /** Node route, once chosen. Immutable after the first dispatched prompt. */
   nodeId: string | null
   nodeLabel: string | null
@@ -69,6 +76,20 @@ export function transitionAllowed(from: WorkbenchTaskStatus, to: WorkbenchTaskSt
  */
 export function isTerminal(status: WorkbenchTaskStatus): status is TerminalWorkbenchTaskStatus {
   return status === 'completed' || status === 'failed' || status === 'cancelled'
+}
+
+/**
+ * The execution outcome a view really settled into: `reported` is an
+ * acknowledgment facet, so its terminal outcome answers instead of the status
+ * itself. Non-reported terminal statuses answer themselves; anything else is
+ * unsettled (null).
+ * @param view - task view (or record) carrying status and terminalOutcome.
+ * @returns the real terminal outcome, or null while unsettled/unrecoverable.
+ */
+export function effectiveTerminalOutcome(view: Pick<WorkbenchTaskView, 'status' | 'terminalOutcome'>): TerminalWorkbenchTaskStatus | null {
+  if (isTerminal(view.status)) return view.status
+  if (view.status === 'reported') return view.terminalOutcome
+  return null
 }
 
 /**
@@ -137,6 +158,7 @@ export function projectTaskView(record: WorkbenchTaskRecord): WorkbenchTaskView 
     title: record.title,
     promptPreview: record.prompt.slice(0, PROMPT_PREVIEW_CHARS),
     status: record.status,
+    terminalOutcome: record.terminalOutcome,
     zcodeDelivery: zcodeDeliveryOf(record),
     awaitingInput: record.awaitingInput,
     echoLost: record.echoLost,

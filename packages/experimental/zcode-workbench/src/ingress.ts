@@ -183,6 +183,7 @@ export function createIngressRoute(route: string, tokenFile: string, store: Task
         workbenchTaskId: view.workbenchTaskId,
         source: view.source,
         status: view.status,
+        terminalOutcome: view.terminalOutcome,
         zcodeDelivery: view.zcodeDelivery,
         awaitingInput: view.awaitingInput,
         echoLost: view.echoLost,

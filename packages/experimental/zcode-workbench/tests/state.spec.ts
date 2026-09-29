@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  isTerminal, projectTaskView, resultPreviewOf, retryAllowed, routeLocked, transitionAllowed,
+  effectiveTerminalOutcome, isTerminal, projectTaskView, resultPreviewOf, retryAllowed, routeLocked, transitionAllowed,
   zcodeDeliveryOf, type WorkbenchTaskRecord,
 } from '../src/state.ts'
 
@@ -13,6 +13,7 @@ function record(fields: Partial<WorkbenchTaskRecord> = {}): WorkbenchTaskRecord 
     title: 'title',
     prompt: 'prompt body',
     status: 'received',
+    terminalOutcome: null,
     nodeId: null,
     nodeLabel: null,
     workspacePath: null,
@@ -87,6 +88,22 @@ describe('workbench task state machine', () => {
     expect(view.workbenchTaskId).toBe('WB-20260921-001')
     expect(view).not.toHaveProperty('prompt')
     expect(view).not.toHaveProperty('transcript')
+  })
+
+  it('keeps the real terminal outcome answerable behind reported', () => {
+    // Terminal statuses answer themselves.
+    expect(effectiveTerminalOutcome({ status: 'completed', terminalOutcome: 'completed' })).toBe('completed')
+    expect(effectiveTerminalOutcome({ status: 'failed', terminalOutcome: 'failed' })).toBe('failed')
+    // reported defers to the recorded outcome — never to a blanket success.
+    expect(effectiveTerminalOutcome({ status: 'reported', terminalOutcome: 'completed' })).toBe('completed')
+    expect(effectiveTerminalOutcome({ status: 'reported', terminalOutcome: 'failed' })).toBe('failed')
+    expect(effectiveTerminalOutcome({ status: 'reported', terminalOutcome: 'cancelled' })).toBe('cancelled')
+    expect(effectiveTerminalOutcome({ status: 'reported', terminalOutcome: null })).toBeNull()
+    // Unsettled statuses have no outcome.
+    expect(effectiveTerminalOutcome({ status: 'running', terminalOutcome: null })).toBeNull()
+    expect(effectiveTerminalOutcome({ status: 'awaiting_route', terminalOutcome: null })).toBeNull()
+    // The wire projection carries the field through.
+    expect(projectTaskView(record({ status: 'reported', terminalOutcome: 'failed' })).terminalOutcome).toBe('failed')
   })
 
   it('reports the tail of the last assistant message', () => {

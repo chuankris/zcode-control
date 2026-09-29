@@ -134,6 +134,46 @@ if (listTasksIdx !== -1) {
   }
 }
 
+// ---------- --task-snapshot: the adapter's read-only conversation snapshot ----------
+
+const snapshotIdx = process.argv.indexOf("--task-snapshot");
+if (snapshotIdx !== -1) {
+  // Mirrors the real adapter's identity gate: the task id must be visible in
+  // the requested workspace's own index before any conversation is read. The
+  // mode journals itself so tests can prove no ACP method ever ran for it.
+  const snapshotTaskId = process.argv[snapshotIdx + 1] ?? "";
+  const snapshotWorkspace = process.argv[snapshotIdx + 2] ?? "/site/default";
+  journal("--task-snapshot", { taskId: snapshotTaskId, workspace: snapshotWorkspace });
+  const rows = Object.hasOwn(DESKTOP_TASKS, snapshotWorkspace) ? DESKTOP_TASKS[snapshotWorkspace] : [];
+  const known = rows.some((task) => task.taskId === snapshotTaskId);
+  if (scenario === "snapshot-fail") {
+    process.stderr.write("[fake-acp-agent] task-snapshot: fixture site: snapshot read failed (snapshot unreadable)\n");
+    setImmediate(() => process.exit(1));
+  } else if (!known) {
+    const report = { taskId: snapshotTaskId, reason: "task-missing" };
+    process.stdout.write(`[fake-acp-agent] task-snapshot: ${JSON.stringify(report)}\n`);
+    process.stderr.write("[fake-acp-agent] task-snapshot: unavailable (task-missing)\n");
+    setImmediate(() => process.exit(1));
+  } else {
+    const report = {
+      taskId: snapshotTaskId,
+      phase: "completedSuccess",
+      pendingInteractions: 0,
+      partial: true,
+      rowCount: 3,
+      sampledAt: "2026-09-21T05:00:00.000Z",
+      reason: null,
+      summary: [
+        { kind: "user", rowId: 0, text: "原生任务的原问题" },
+        { kind: "tool", rowId: 1, toolCallId: "tool-1", title: "Read", status: "completed" },
+        { kind: "assistant", rowId: 2, text: "原生任务最后的回答，含 **要点**。" },
+      ],
+    };
+    process.stdout.write(`[fake-acp-agent] task-snapshot: ${JSON.stringify(report)}\n`);
+    setImmediate(() => process.exit(0));
+  }
+}
+
 // ---------- --reconcile-dispatch: the adapter's verify-then-release mode ----------
 
 const RECONCILE_TERMINAL_PHASES = new Set(["completedSuccess", "completedInterrupted", "error"]);

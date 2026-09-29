@@ -7,7 +7,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { isTerminal, transitionAllowed, type WorkbenchTaskRecord } from './state.ts'
-import type { WorkbenchTaskSource } from './types.ts'
+import type { TerminalWorkbenchTaskStatus, WorkbenchTaskSource } from './types.ts'
 
 /** Persisted file envelope; `v` guards the shape on load. */
 interface TaskFile {
@@ -113,6 +113,7 @@ export class TaskStore {
         if (task.promptSentAt === null) continue
         if (task.status !== 'dispatching' && task.status !== 'zcode_acknowledged' && task.status !== 'running') continue
         task.status = 'failed'
+        task.terminalOutcome = 'failed'
         task.echoLost = true
         task.awaitingInput = false
         task.lastError = 'the workbench restarted while the desktop task was active; the desktop outcome is unknown — verify the task in the Zcode desktop'
@@ -159,6 +160,7 @@ export class TaskStore {
         title: input.title,
         prompt: input.prompt,
         status: 'received',
+        terminalOutcome: null,
         nodeId: null,
         nodeLabel: null,
         workspacePath: null,
@@ -267,6 +269,12 @@ export class TaskStore {
         throw new Error(`illegal task transition ${record.status} -> ${to} for ${workbenchTaskId}`)
       }
       record.status = to
+      // Terminal outcomes settle once and survive the later `reported` marking
+      // (a report acknowledges the result, it never replaces it); leaving a
+      // terminal state for a non-terminal one (a pre-send retry re-entering
+      // dispatch) unsettles the record again.
+      if (isTerminal(to)) record.terminalOutcome = to
+      else if (to !== 'reported') record.terminalOutcome = null
       record.transcript.push({ at: new Date().toISOString(), kind: 'status', text: to, key: null, toolStatus: null })
       Object.assign(record, fields)
     })
@@ -277,7 +285,25 @@ function cloneRecord(record: WorkbenchTaskRecord): WorkbenchTaskRecord {
   return { ...record, transcript: record.transcript.map(event => ({ ...event })) }
 }
 
-/** Default fields added after the persisted shape grew; old files keep loading. */
+/**
+ * Default fields added after the persisted shape grew; old files keep loading.
+ * For records that predate `terminalOutcome`, the durable status trace recovers
+ * it: every transition appends a status event, so the last terminal event
+ * names the outcome even after `reported` replaced the status. Records whose
+ * trace cannot answer (already reported with no terminal event) stay null and
+ * surface as "result needs verification".
+ */
 function normalizeRecord(record: WorkbenchTaskRecord): WorkbenchTaskRecord {
-  return { ...record, desktopTaskId: record.desktopTaskId ?? null }
+  const recovered = record.terminalOutcome ?? recoverTerminalOutcome(record)
+  return { ...record, desktopTaskId: record.desktopTaskId ?? null, terminalOutcome: recovered }
+}
+
+/** Last terminal status event of the trace, when one exists. */
+function recoverTerminalOutcome(record: WorkbenchTaskRecord): TerminalWorkbenchTaskStatus | null {
+  if (!isTerminal(record.status) && record.status !== 'reported') return null
+  for (let index = record.transcript.length - 1; index >= 0; index -= 1) {
+    const text = record.transcript[index]?.text
+    if (text === 'completed' || text === 'failed' || text === 'cancelled') return text
+  }
+  return null
 }

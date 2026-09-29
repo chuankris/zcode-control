@@ -62,7 +62,9 @@ git checkout dd001952e2bac15c28d370f204c33f7d96d0d3ef
 
 只有 `adapter.mjs --config <file>` 一种启动形式。所有键都会校验；配置错误在任何连接之前退出。
 
-ACP 模式之外有两个只读一次性标志。`--health` 执行一次发现并打印固定字符串站点摘要（在线退出 0，离线退出 1）。`--list-tasks [<workspacePath>]` 连接一次、桥接恰好一个工作区，并通过官方 `zcode-task/listTasks` 通道读取桌面自己的已同步任务索引（`ZCodeTaskMeta` 行：任务 ID、标题、持久化状态、时间戳），输出一行 `[zcode-desktop-adapter] tasks: <json>`。session 模式必须给出工作区路径；fixed 模式不接受路径（工作区已固定在配置中）。本适配器通过已记录绑定拥有的行标记 `origin: "workbench"` 并携带 DSH 侧会话 ID，供工作台连接两份任务列表；其余行为 `origin: "desktop"`。标题经过凭据与 URL 清洗，行数有上限；列举失败以固定字符串原因退出 1——索引边界是真实的：只包含该工作区在桌面已同步、未置顶、未归档的任务，不是完整历史。
+ACP 模式之外有三个只读一次性标志。`--health` 执行一次发现并打印固定字符串站点摘要（在线退出 0，离线退出 1）。`--list-tasks [<workspacePath>]` 连接一次、桥接恰好一个工作区，并通过官方 `zcode-task/listTasks` 通道读取桌面自己的已同步任务索引（`ZCodeTaskMeta` 行：任务 ID、标题、持久化状态、时间戳），输出一行 `[zcode-desktop-adapter] tasks: <json>`。session 模式必须给出工作区路径；fixed 模式不接受路径（工作区已固定在配置中）。本适配器通过已记录绑定拥有的行标记 `origin: "workbench"` 并携带 DSH 侧会话 ID，供工作台连接两份任务列表；其余行为 `origin: "desktop"`。标题经过凭据与 URL 清洗，行数有上限；列举失败以固定字符串原因退出 1——索引边界是真实的：只包含该工作区在桌面已同步、未置顶、未归档的任务，不是完整历史。
+
+`--task-snapshot <taskId> [<workspacePath>]` 是原生任务只读详情入口：先经同一 `zcode-task/listTasks` 索引验证身份——完整任务 ID 必须出现在所桥接工作区自己的索引里（跨工作区请求以 `task-missing` 拒绝）——再走官方订阅路径（`helloConversationV4`/`initializeConversationV4`/`subscribeConversationV4`）读取该对话的实时快照，输出一行 `[zcode-desktop-adapter] task-snapshot: <json>`：`phase`、`pendingInteractions`、按桌面行序的有界脱敏摘要（仅收录桌面标记为用户 authored 的输入行——`origin: realUser` 或 `guided`——引擎内部输入行不是对话轮次；助手文本与工具卡片同投影；摘要至多 200 行——超出时保留最新 200 条可投影行、显示仍按 rowId 正序，最新回复永不掉队；每条 16 KiB 封顶，文本先脱敏后截断，`reasoning` 行与未知行不投影）、`rowCount`，以及 `partial` 标志——官方快照的 `rows.window` 是尾窗口，仅当其自带 `totalCount` 证明窗口覆盖全部行且摘要未触及行数上限时才为 `false`，尾窗口与被截断的摘要都永不冒充完整历史。该模式绝不 `session/adopt`、绝不建会话或任务、绝不发送任何会话命令；读取失败以机器稳定原因（`task-missing`、`index-unreadable`、`snapshot-unreadable`、`internal-error`）输出并退出 1。session 模式必须给出路径；fixed 模式不接受路径；与其他一次性模式互斥。模式自带一枚有引用的硬截止（`max(30s, 2×requestTimeoutMs+5s)`）：即便内部等待全部使用非引用定时器且调用方关闭 stdin，整趟读取也必然有界落定并输出恰好一行报告（超时为 `snapshot-unreadable`），不会以未决的顶层 await 静默退出。
 
 | 键 | 含义 |
 | --- | --- |
@@ -118,7 +120,7 @@ node adapter.mjs --config <private-json> --health
 | 退出码 | 含义 |
 | --- | --- |
 | 0 | 正常结束（stdio 关闭或信号）。 |
-| 1 | `--health` 判定站点离线或配置不可用、`--list-tasks` 失败，或 `--reconcile-dispatch` 被拒绝（未核销任何内容）。 |
+| 1 | `--health` 判定站点离线或配置不可用、`--list-tasks` 失败、`--task-snapshot` 读取失败，或 `--reconcile-dispatch` 被拒绝（未核销任何内容）。 |
 | 2 | 配置错误。 |
 | 7 | 入站 JSON-RPC 帧超过大小限制。 |
 | 8 | remoteClientRoot 未暴露预期模块。 |
@@ -156,6 +158,8 @@ node --test integrations/zcode-desktop-adapter/test/adapter.test.mjs
 现场模式新增覆盖：只读发现输出工作区选项（取值、标签、健康元数据）、发现失败不留绑定也不派发、路径重复拒绝、未选择即 prompt 被拒、列表外选择被拒且绑定保持未选定、选择钉定并以真实 `createSession` 工作区 ID 验证、派发后选择不可变、站点绑定的设备身份隔离、未派发会话 session/load 重新发现并保持（或拒绝已消失的）选择、`--health` 在线/离线输出与凭据清洗、两种模式的配置校验（旧固定配置行为不变、session 加固定 workspace 拒绝、fixed 缺 workspace 仍拒绝、未知选择器拒绝）。针对单控制器槽位的并发：回合进行中的 `session/new` 发现返回 busy，不再开出第二条中继配对（不踢控制器、不写绑定）；回合仍完整流回最终回答——包括终态补丁先于最后一段完整正文行的收尾帧；排在未完成发现之后的 prompt 等待槽位释放而不是争抢。
 
 `--list-tasks` 新增覆盖：以精确 `zcode-task/listTasks` 作用域（从 bridge 日志断言工作区路径与身份）读取单个工作区的已同步索引、行投影（无效行跳过、未知状态回退、标题 URL 清洗、按更新时间降序、其他工作区行绝不串入）；绑定归属经端到端验证（先跑一轮真实派发，再列举时该桌面任务标记 `origin: "workbench"` 并携带 DSH 会话 ID，而桌面创建的任务保持 `origin: "desktop"`）；离线、工作区未注册、桌面索引错误均以清洗后的固定字符串原因退出 1；模式参数规则（session 无路径、fixed 带路径）在任何连接之前退出 2。
+
+`--task-snapshot` 新增覆盖：端到端只读读取——身份先经所桥接工作区自己的索引验证（journal 断言全程零 `sendConversationCommandV4`、恰好一次控制器配对、凭据与 URL 不泄漏）；摘要按桌面行序投影、仅收录用户 authored 输入行（`origin: realUser` 或 `guided`，引擎行与无标记行不进入摘要）、文本与标题先脱敏后截断（跨界 secret 整体替换、截断的半截标记被清理）、`reasoning` 与未知行不投影；`rows.totalCount` 覆盖窗口且摘要未触及上限时 `partial` 为 false，窗口短于总数或摘要被 200 行上限截断时为 true；任务不在所桥接工作区索引时以 `task-missing` 拒绝且不做任何会话握手；session 模式跨工作区隔离（A 工作区任务经 B 工作区读取拒绝、经 A 读取成功）；快照不可读以 `snapshot-unreadable` 退出 1；closed-stdin（stdin 被忽略）下模式凭自身有引用的硬截止仍输出报告行；模式参数规则（session 缺路径、fixed 带路径、与其他一次性模式互斥）在任何连接之前退出 2。
 
 `session/adopt` 新增覆盖：对已存在桌面任务的端到端续写——仅一条 `sendText`（`startNow`）命令发往同一任务 ID，断言 `createSession` 与 `zcode-task/createTask` 全程缺席，任务经桥接工作区作用域内的 `listTasks` 验证；无法证明可续写任务的拒绝矩阵（索引缺失、索引 running/error、索引 completed 但实时会话仍在运行或等待输入）均不写绑定、不派发；跨适配器重启复用工作台派发已创建的绑定（单绑定、`created: false`）；被 adopt 绑定的重启恢复（`session/load` 回放加同一任务 ID 的又一轮 `sendText`）；发送回执丢失时派发台账保留并阻断后续 prompt 且不重发；工作区参数规则（session 模式必填路径并把绑定钉在规范化工作区、经不同拼写路径重新 adopt 复用绑定、fixed 模式拒绝路径）。尾部收尾新增覆盖：经门控延迟到终态补丁之后的全文行仍完整流回（2026-09-28 实测截断形态），全程仅一条命令、绝不新建替代任务；完整短答靠静默收敛在回合预算内远早于截止地结束，而不是等待不会到来的帧；终态补丁之后的慢速 row.delta 尾滴在回合结束前全部流回，且绝不触发重发。
 

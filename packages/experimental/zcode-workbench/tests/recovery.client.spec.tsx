@@ -47,9 +47,9 @@ function fixtureListing(): ZcodeWorkspaceListing {
 function viewOf(id: string): WorkbenchTaskView {
   return {
     workbenchTaskId: id, source: 'workbench', sourceTaskId: null, threadId: null, title: 't',
-    promptPreview: 'p', status: 'dispatching', zcodeDelivery: 'pending', awaitingInput: false,
-    echoLost: false, lastError: null, nodeId: 'local-1', nodeLabel: 'n', workspacePath: '/w',
-    workspaceLabel: 'w', acpSessionId: null, desktopTaskId: null, createdAt: '2026-09-21T00:00:00.000Z', updatedAt: '2026-09-21T00:00:00.000Z',
+    promptPreview: 'p', status: 'dispatching', terminalOutcome: null, zcodeDelivery: 'pending', awaitingInput: false,
+    echoLost: false, lastError: null, nodeId: 'local-1', nodeLabel: 'n', workspacePath: '/site/default',
+    workspaceLabel: 'default', acpSessionId: null, desktopTaskId: null, createdAt: '2026-09-21T00:00:00.000Z', updatedAt: '2026-09-21T00:00:00.000Z',
   }
 }
 
@@ -66,6 +66,7 @@ function panelProps(overrides: Partial<WorkbenchActions> = {}): WorkbenchPanelPr
       desktop: { state: 'ok', desktopVersion: '3.14.0', tasks: [] },
       workbench: [],
     }),
+    desktopTaskSnapshot: async () => ({ state: 'unavailable', reason: 'not read in this test' }),
     tasks: async () => [],
     task: async () => undefined,
     composeTask: async () => { throw new Error('unused') },
@@ -118,18 +119,20 @@ describe('host restart recovery', () => {
     // errors are not stacked over the empty list.
     expect(await screen.findByText('工作台服务暂不可用，正在自动重连…')).toBeDefined()
 
-    // Host back: the reconnect notification drives an immediate re-pull.
+    // Host back: the reconnect notification drives an immediate re-pull; the
+    // single node auto-expands and its workspace shows the record count.
     reachable = true
     connection.set('connected')
     notifyWorkbenchRefresh()
-    expect(await screen.findByText('t')).toBeDefined()
+    expect(await screen.findByText(/1 条工作台会话/)).toBeDefined()
     expect(screen.queryByText(/transport failure/)).toBeNull()
   })
 
   it('contains a surface render failure instead of unmounting the page, and retries', async () => {
     let poisoned = true
     const translate = (key: WorkbenchKey | string, params?: Record<string, unknown>): string => {
-      if (poisoned && key === 'status_dispatching') throw new Error('render boom')
+      // Poison a key the home column renders inside the boundary.
+      if (poisoned && key === 'homeColumnTitle') throw new Error('render boom')
       return translateStub(key, params)
     }
     const props = {
@@ -147,7 +150,8 @@ describe('host restart recovery', () => {
 
     poisoned = false
     fireEvent.click(screen.getByRole('button', { name: '重试' }))
-    expect(await screen.findByText('t')).toBeDefined()
+    expect(await screen.findByText('Zcode 工作台')).toBeDefined()
+    expect(await screen.findByText(/1 条工作台会话/)).toBeDefined()
     expect(screen.getByText('page-root-sentinel')).toBeDefined()
   })
 

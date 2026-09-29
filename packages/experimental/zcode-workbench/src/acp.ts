@@ -11,7 +11,7 @@
  * stderr is used only as fixed-string failure detail.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { NO_WORKSPACE_OPTION_MARKER, type ZcodeNodeRecord, type ZcodeWorkspaceOption } from './types.ts'
+import { NO_WORKSPACE_OPTION_MARKER, type ZcodeDesktopTaskSnapshotEntry, type ZcodeDesktopTaskSnapshotResult, type ZcodeNodeRecord, type ZcodeWorkspaceOption } from './types.ts'
 
 /** JSON-RPC request frame written to the agent. */
 interface AcpRequest {
@@ -630,6 +630,109 @@ export async function listDesktopTasks(node: ZcodeNodeRecord, workspacePath: str
   return {
     desktopVersion: typeof report.desktopVersion === 'string' ? report.desktopVersion : null,
     tasks,
+  }
+}
+
+/** Marker prefix of the adapter's one-line `--task-snapshot` report. */
+const TASK_SNAPSHOT_LINE_MARKER = '] task-snapshot: '
+
+/** One `--task-snapshot` report row as the adapter prints it (validated). */
+interface SnapshotWireEntry {
+  kind: 'user' | 'assistant' | 'tool'
+  rowId: number
+  text: string | null
+  toolCallId: string | null
+  title: string | null
+  status: string | null
+}
+
+/**
+ * Read one native desktop task's conversation snapshot through the adapter's
+ * read-only `--task-snapshot` mode: one short-lived adapter process, no
+ * session, no adoption, no dispatch. The adapter verifies the task against
+ * the bridged workspace's own synced index before subscribing; the report is
+ * a process boundary — every field is validated and unusable shapes surface
+ * as `unavailable`, never as guessed content.
+ * @param node - target node launcher.
+ * @param workspacePath - selected workspace; empty for `fixed` nodes.
+ * @param desktopTaskId - full desktop task (conversation session) id.
+ * @param timeoutMs - read budget.
+ * @returns the ok/unavailable snapshot result.
+ */
+export async function readDesktopTaskSnapshot(
+  node: ZcodeNodeRecord,
+  workspacePath: string,
+  desktopTaskId: string,
+  timeoutMs: number,
+): Promise<ZcodeDesktopTaskSnapshotResult> {
+  const args = [
+    ...node.args,
+    '--task-snapshot',
+    desktopTaskId,
+    ...(workspacePath.length > 0 ? [workspacePath] : []),
+  ]
+  let stdout = ''
+  const agent = new AcpAgentProcess(node.command, args, () => {}, (line) => { stdout += `${line}\n` })
+  const timer = setTimeout(() => { void agent.kill() }, timeoutMs)
+  timer.unref?.()
+  try {
+    await agent.waitExited()
+  } finally {
+    clearTimeout(timer)
+    await agent.close().catch(() => undefined)
+  }
+  const line = stdout.split('\n').map(part => part.trim()).find(part => part.includes(TASK_SNAPSHOT_LINE_MARKER))
+  if (line === undefined) {
+    const detail = agent.stderrDetail().length > 0 ? ` (${agent.stderrDetail()})` : ''
+    return { state: 'unavailable', reason: `the node did not report a task snapshot${detail}` }
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(line.slice(line.indexOf(TASK_SNAPSHOT_LINE_MARKER) + TASK_SNAPSHOT_LINE_MARKER.length))
+  } catch {
+    return { state: 'unavailable', reason: 'the node reported a malformed task snapshot' }
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    return { state: 'unavailable', reason: 'the node reported a malformed task snapshot' }
+  }
+  const row = parsed as Record<string, unknown>
+  if (typeof row.taskId !== 'string' || row.taskId !== desktopTaskId) {
+    return { state: 'unavailable', reason: 'the node reported a snapshot for another task' }
+  }
+  if (typeof row.reason === 'string' && row.reason.length > 0) {
+    return { state: 'unavailable', reason: row.reason }
+  }
+  const summaryInput = Array.isArray(row.summary) ? row.summary : []
+  const summary: ZcodeDesktopTaskSnapshotEntry[] = []
+  for (const entry of summaryInput) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const item = entry as Partial<SnapshotWireEntry>
+    if (typeof item.rowId !== 'number' || !Number.isFinite(item.rowId)) continue
+    if (item.kind === 'user' || item.kind === 'assistant') {
+      summary.push({ rowId: item.rowId, kind: item.kind, text: typeof item.text === 'string' ? item.text : '', toolTitle: null, toolStatus: null })
+      continue
+    }
+    if (item.kind === 'tool') {
+      summary.push({
+        rowId: item.rowId,
+        kind: 'tool',
+        text: null,
+        toolTitle: typeof item.title === 'string' && item.title.length > 0 ? item.title : 'tool',
+        toolStatus: typeof item.status === 'string' ? item.status : 'pending',
+      })
+    }
+  }
+  return {
+    state: 'ok',
+    snapshot: {
+      taskId: row.taskId,
+      phase: typeof row.phase === 'string' ? row.phase : null,
+      pendingInteractions: typeof row.pendingInteractions === 'number' && Number.isFinite(row.pendingInteractions) ? row.pendingInteractions : null,
+      partial: row.partial !== false,
+      rowCount: typeof row.rowCount === 'number' && Number.isFinite(row.rowCount) ? row.rowCount : summary.length,
+      sampledAt: typeof row.sampledAt === 'string' ? row.sampledAt : '',
+      summary,
+    },
   }
 }
 

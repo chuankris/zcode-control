@@ -103,13 +103,18 @@ describe('zcode workbench dispatch (REAL composition over the fixture agent)', (
       const detail = await ctx.zcodeWorkbench.task(created.workbenchTaskId)
       const statusTrace = detail!.transcript.filter(event => event.kind === 'status').map(event => event.text)
       expect(statusTrace).toEqual(expect.arrayContaining(['dispatching', 'zcode_acknowledged', 'running']))
-      // The observer's own read marks the terminal workbench-origin task reported.
+      // Reading the terminal workbench-origin task marks it reported.
       expect(seen.has('completed') || seen.has('reported')).toBe(true)
       expect(sawAwaitingInput).toBe(true)
       expect(final.awaitingInput).toBe(false)
       expect(final.zcodeDelivery).toBe('terminal')
       expect(final.echoLost).toBe(false)
       expect(final.acpSessionId).toBe('fake-acp-session-1')
+      // The reported marking never overwrites the real execution outcome.
+      expect(final.terminalOutcome).toBe('completed')
+      expect(detail!.status).toBe('reported')
+      expect(detail!.terminalOutcome).toBe('completed')
+      expect(detail!.prompt).toBe('run the fixture task')
 
       const texts = detail!.transcript.map(event => event.text)
       expect(texts).toContain('first segment plus appended segment')
@@ -117,8 +122,6 @@ describe('zcode workbench dispatch (REAL composition over the fixture agent)', (
       expect(texts).toContain('Read')
       // The approval card never lands in the transcript; it drives awaitingInput only.
       expect(detail!.transcript.every(event => event.key !== 'zdesktop-approval')).toBe(true)
-      // Reading the terminal workbench-origin task marks it reported.
-      expect(detail!.status).toBe('reported')
 
       // The route locked with the first dispatched prompt.
       await expect(ctx.zcodeWorkbench.routeTask({ workbenchTaskId: created.workbenchTaskId, nodeId, workspacePath: '/site/lab' }))
@@ -183,6 +186,8 @@ describe('zcode workbench dispatch (REAL composition over the fixture agent)', (
       expect(retried.workbenchTaskId).toBe(created.workbenchTaskId)
       const { final: done } = await observe(ctx, created.workbenchTaskId, view => view.status === 'completed' || view.status === 'reported')
       expect(['completed', 'reported']).toContain(done.status)
+      // The retry's fresh outcome settles; an earlier failed outcome is gone.
+      expect(done.terminalOutcome).toBe('completed')
       const every = await ctx.zcodeWorkbench.tasks()
       expect(every.filter(task => task.source === 'workbench')).toHaveLength(1)
     } finally {

@@ -10,7 +10,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import z from '@deepseek-ai/schemastery'
-import { AcpAgentProcess, listDesktopTasks, listWorkspaceOptions, probeHealth, reconcileFollowupDispatch, runDispatch, sameWorkspacePath, type DispatchEvent } from './acp.ts'
+import { AcpAgentProcess, listDesktopTasks, listWorkspaceOptions, probeHealth, readDesktopTaskSnapshot, reconcileFollowupDispatch, runDispatch, sameWorkspacePath, type DispatchEvent } from './acp.ts'
 import { createIngressRoute } from './ingress.ts'
 import { NodeStore, validateNodeInput } from './nodes.ts'
 import { isTerminal, projectTaskView, retryAllowed, routeLocked, transitionAllowed } from './state.ts'
@@ -18,7 +18,8 @@ import { TaskStore } from './store.ts'
 import type {
   IngressInfo, WorkbenchComposeRequest, WorkbenchContinueRequest, WorkbenchNodeInput, WorkbenchReconcileFollowupRequest,
   WorkbenchReconcileFollowupResult, WorkbenchRouteRequest, WorkbenchTaskDetailView, WorkbenchTaskStatus, WorkbenchTaskView,
-  WorkspaceTasksView, ZcodeDesktopTaskView, ZcodeNodeRecord, ZcodeNodeView, ZcodeWorkspaceListing,
+  WorkspaceTasksView, ZcodeDesktopTaskSnapshotResult, ZcodeDesktopTaskView, ZcodeNodeRecord, ZcodeNodeView,
+  ZcodeWorkspaceListing,
 } from './types.ts'
 
 /** Deployment-owned settings; credentials live in adapter configuration files the nodes point at. */
@@ -258,11 +259,52 @@ export class ZcodeWorkbench extends TypertRemoteService {
       throw new Error('this node selects its workspace per session; pick one before reading its tasks')
     }
     const effectivePath = node.workspaceSelection === 'fixed' ? '' : workspacePath
-    const records = this.taskStore.list().filter(record => record.nodeId === node.id
+    let records = this.taskStore.list().filter(record => record.nodeId === node.id
       && (node.workspaceSelection === 'fixed' || (record.workspacePath !== null && sameWorkspacePath(record.workspacePath, workspacePath))))
     let desktop: WorkspaceTasksView['desktop']
     try {
       const report = await this.enqueueNode(node.id, () => listDesktopTasks(node, effectivePath, this.config.healthTimeoutMs))
+      // Adapter-verified identity backfill: a fresh compose round records
+      // only its ACP session id — its desktop task id lives solely in the
+      // adapter's binding. The index rows carry that verified link
+      // (dshSessionId → taskId), so the first listing that sees it stamps the
+      // durable desktopTaskId onto the round, keeping the round chain one
+      // conversation after completion, restarts, and index outages (the
+      // sampled join alone cannot). Conservative on purpose: only records
+      // with no desktopTaskId yet, only sessions the index binds to exactly
+      // one task, never a rewrite, never a guess — a missing or conflicted
+      // binding leaves the record untouched.
+      const sessionOwners = new Map<string, string>()
+      const conflictedSessions = new Set<string>()
+      for (const task of report.tasks) {
+        if (task.dshSessionId === undefined || task.taskId.length === 0) continue
+        const owner = sessionOwners.get(task.dshSessionId)
+        if (owner === undefined) sessionOwners.set(task.dshSessionId, task.taskId)
+        else if (owner !== task.taskId) conflictedSessions.add(task.dshSessionId)
+      }
+      let backfilled = false
+      for (const record of records) {
+        if (record.desktopTaskId !== null || record.acpSessionId === null) continue
+        if (conflictedSessions.has(record.acpSessionId)) continue
+        const taskId = sessionOwners.get(record.acpSessionId)
+        if (taskId === undefined) continue
+        const session = record.acpSessionId
+        const updated = await this.taskStore.update(record.workbenchTaskId, current => {
+          // Re-check inside the serialized transaction: an interleaved update
+          // (a concurrent listing, a racing dispatch transition) may have
+          // claimed the record between the snapshot and this write. The
+          // adapter-verified binding only ever stamps an unclaimed record of
+          // the same session on the same node — an existing desktop task id,
+          // a moved session, or a rerouted record is never overwritten.
+          if (current.desktopTaskId !== null || current.acpSessionId !== session || current.nodeId !== node.id) return
+          current.desktopTaskId = taskId
+        })
+        if (updated !== undefined && updated.desktopTaskId === taskId) backfilled = true
+      }
+      if (backfilled) {
+        records = this.taskStore.list().filter(record => record.nodeId === node.id
+          && (node.workspaceSelection === 'fixed' || (record.workspacePath !== null && sameWorkspacePath(record.workspacePath, workspacePath))))
+      }
       // Newest record wins per binding id: a continued desktop task may have
       // several rounds sharing one adapter session, and an explicit
       // desktopTaskId link names the newest continuation round exactly.
@@ -294,6 +336,35 @@ export class ZcodeWorkbench extends TypertRemoteService {
   }
 
   /**
+   * Read one native desktop task's conversation snapshot through the node's
+   * read-only `--task-snapshot` mode. The read is a one-shot adapter process
+   * with no session, no `session/adopt`, and no effect on the desktop task —
+   * opening a detail never adopts. The site's single control channel is
+   * respected through the node queue: a snapshot read waits behind an active
+   * dispatch instead of pairing a second controller connection, and a failed
+   * read answers `unavailable` with its reason instead of being faked.
+   * @param id - node id.
+   * @param workspacePath - selected workspace; required for `session` nodes,
+   *   ignored for `fixed` nodes (the adapter resolves its pinned workspace).
+   * @param desktopTaskId - full desktop task (conversation session) id.
+   * @returns the ok/unavailable snapshot result.
+   */
+  @Remote
+  async desktopTaskSnapshot(id: string, workspacePath: string, desktopTaskId: string): Promise<ZcodeDesktopTaskSnapshotResult> {
+    await this.ready
+    if (desktopTaskId.length === 0 || desktopTaskId.length > 200) {
+      throw new Error('desktopTaskId must be 1..200 characters')
+    }
+    const node = this.nodeRegistry.get(id)
+    if (node === undefined) throw new Error(`unknown node ${id}`)
+    if (node.workspaceSelection === 'session' && workspacePath.length === 0) {
+      throw new Error('this node selects its workspace per session; pick one before reading a task snapshot')
+    }
+    const effectivePath = node.workspaceSelection === 'fixed' ? '' : workspacePath
+    return this.enqueueNode(node.id, () => readDesktopTaskSnapshot(node, effectivePath, desktopTaskId, this.config.healthTimeoutMs))
+  }
+
+  /**
    * Every retained task, newest first.
    * @returns independent wire views.
    */
@@ -319,7 +390,12 @@ export class ZcodeWorkbench extends TypertRemoteService {
       await this.taskStore.transition(workbenchTaskId, 'reported')
       record = this.taskStore.get(workbenchTaskId) ?? record
     }
-    return { ...projectTaskView(record), transcript: record.transcript.map(event => ({ ...event })), retryAllowed: retryAllowed(record) }
+    return {
+      ...projectTaskView(record),
+      prompt: record.prompt,
+      transcript: record.transcript.map(event => ({ ...event })),
+      retryAllowed: retryAllowed(record),
+    }
   }
 
   /**
@@ -571,7 +647,11 @@ export class ZcodeWorkbench extends TypertRemoteService {
     const note = `written off after on-site verification: the desktop command ${report.commandId ?? 'unknown'} was not applied; operator ${confirm.operator}`
     await this.taskStore.update(request.workbenchTaskId, (current) => {
       if (!current.echoLost) throw new Error('the round was already reconciled while this pass ran')
-      if (transitionAllowed(current.status, 'cancelled')) current.status = 'cancelled'
+      if (transitionAllowed(current.status, 'cancelled')) {
+        current.status = 'cancelled'
+        current.terminalOutcome = 'cancelled'
+        current.transcript.push({ at: new Date().toISOString(), kind: 'status', text: 'cancelled', key: null, toolStatus: null })
+      }
       current.echoLost = false
       current.awaitingInput = false
       current.lastError = note

@@ -8,10 +8,12 @@
   "files": [
     "src/client/index.ts",
     "src/client/Panel.tsx",
+    "src/client/markdown.tsx",
     "src/client/locales.ts",
     "src/client/css-modules.d.ts",
     "src/types.ts",
-    "src/state.ts"
+    "src/state.ts",
+    "src/taskCenter.ts"
   ],
   "references": [
     {

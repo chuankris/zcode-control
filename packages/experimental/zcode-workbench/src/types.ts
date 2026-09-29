@@ -28,6 +28,15 @@ export type WorkbenchTaskStatus =
 /** Terminal statuses a task report can be marked from. */
 export type TerminalWorkbenchTaskStatus = 'completed' | 'failed' | 'cancelled'
 
+/**
+ * The execution outcome a record settled into before `reported` consumed it.
+ * `reported` is an acknowledgment facet ("the origin saw the result"), not an
+ * execution result: this field keeps the real terminal outcome queryable so a
+ * reported task is never misread as successful. Null when the outcome predates
+ * the field and the durable status trace cannot recover it.
+ */
+export type WorkbenchTerminalOutcome = TerminalWorkbenchTaskStatus | null
+
 /** Zcode delivery facet: what the Zcode execution side has acknowledged. */
 export type ZcodeDeliveryState = 'pending' | 'acknowledged' | 'running' | 'terminal' | 'echo_lost'
 
@@ -123,6 +132,51 @@ export interface WorkspaceTasksView {
   workbench: WorkbenchTaskView[]
 }
 
+/**
+ * One entry of a native desktop task's read-only conversation snapshot:
+ * user or assistant text, or a compact tool card, in the desktop's own row
+ * order. Text is scrubbed and capped adapter-side; nothing is guessed.
+ */
+export interface ZcodeDesktopTaskSnapshotEntry {
+  /** Desktop row id; orders the entries exactly as the desktop recorded them. */
+  rowId: number
+  kind: 'user' | 'assistant' | 'tool'
+  /** User or assistant text; null for tool entries. */
+  text: string | null
+  /** Tool name; null for text entries. */
+  toolTitle: string | null
+  /** Tool card status; null for text entries. */
+  toolStatus: string | null
+}
+
+/** One read-only conversation snapshot of a native desktop task. */
+export interface ZcodeDesktopTaskSnapshot {
+  taskId: string
+  /** Live conversation phase as the snapshot observed it. */
+  phase: string | null
+  pendingInteractions: number | null
+  /**
+   * The desktop's snapshot is a row tail window: `partial` stays true unless
+   * the snapshot's own row total proves the window covers every row. A
+   * partial read is recent-only content, never full history.
+   */
+  partial: boolean
+  /** Rows the window actually carried. */
+  rowCount: number
+  /** Adapter-side sample time. */
+  sampledAt: string
+  summary: ZcodeDesktopTaskSnapshotEntry[]
+}
+
+/**
+ * Native-task snapshot read result. `unavailable` states the real boundary —
+ * the read failed, the task is not verifiable in the workspace's index, or
+ * the conversation could not be read — and must never be faked.
+ */
+export type ZcodeDesktopTaskSnapshotResult =
+  | { state: 'ok'; snapshot: ZcodeDesktopTaskSnapshot }
+  | { state: 'unavailable'; reason: string }
+
 /** One streamed task transcript entry, scrubbed and capped on the Host. */
 export interface WorkbenchTranscriptEvent {
   at: string
@@ -145,6 +199,12 @@ export interface WorkbenchTaskView {
   /** First characters of the task prompt. */
   promptPreview: string
   status: WorkbenchTaskStatus
+  /**
+   * The real execution outcome behind `reported`: terminal result that the
+   * report acknowledgment never overwrites. Null only for legacy records whose
+   * outcome cannot be recovered ("result needs verification").
+   */
+  terminalOutcome: WorkbenchTerminalOutcome
   /** Zcode delivery facet, distinct from execution failure. */
   zcodeDelivery: ZcodeDeliveryState
   /** The Zcode desktop awaits on-site input (approval) for this task. */
@@ -171,6 +231,8 @@ export interface WorkbenchTaskView {
 
 /** Full task detail with the capped transcript. */
 export interface WorkbenchTaskDetailView extends WorkbenchTaskView {
+  /** The task's own prompt, full and bounded; the detail's "original question". */
+  prompt: string
   transcript: WorkbenchTranscriptEvent[]
   /** Whether an unacknowledged failed dispatch may be retried under the same id. */
   retryAllowed: boolean
@@ -197,6 +259,8 @@ export interface IngressTaskStatusResponse {
   workbenchTaskId: string
   source: WorkbenchTaskSource
   status: WorkbenchTaskStatus
+  /** Real execution outcome behind `reported`; never claimed as success. */
+  terminalOutcome: WorkbenchTerminalOutcome
   zcodeDelivery: ZcodeDeliveryState
   awaitingInput: boolean
   echoLost: boolean

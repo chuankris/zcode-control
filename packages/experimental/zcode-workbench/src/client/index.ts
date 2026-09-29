@@ -9,7 +9,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import remoteContribution from '@deepseek-ai/dsh-experimental-zcode-workbench/remote'
 import type {
   IngressInfo, WorkbenchComposeRequest, WorkbenchContinueRequest, WorkbenchNodeInput, WorkbenchRouteRequest,
-  WorkbenchTaskDetailView, WorkbenchTaskView, WorkspaceTasksView, ZcodeWorkspaceListing,
+  WorkbenchTaskDetailView, WorkbenchTaskView, WorkspaceTasksView, ZcodeDesktopTaskSnapshotResult, ZcodeWorkspaceListing,
 } from '../types.ts'
 import { en, zh, type WorkbenchKey } from './locales.ts'
 import {
@@ -67,6 +67,8 @@ export async function apply(ctx: Context): Promise<() => Promise<void>> {
       listWorkspaces: async (id: string) => unwrap(await ctx.remote.zcodeWorkbench.listWorkspaces(id)) as ZcodeWorkspaceListing,
       workspaceTasks: async (id: string, workspacePath: string) =>
         unwrap(await ctx.remote.zcodeWorkbench.workspaceTasks(id, workspacePath)) as WorkspaceTasksView,
+      desktopTaskSnapshot: async (id: string, workspacePath: string, desktopTaskId: string) =>
+        unwrap(await ctx.remote.zcodeWorkbench.desktopTaskSnapshot(id, workspacePath, desktopTaskId)) as ZcodeDesktopTaskSnapshotResult,
       tasks: async () => unwrap(await ctx.remote.zcodeWorkbench.tasks()) as WorkbenchTaskView[],
       task: async (id: string) => unwrap(await ctx.remote.zcodeWorkbench.task(id)) as WorkbenchTaskDetailView | undefined,
       composeTask: async (request: WorkbenchComposeRequest) => unwrap(await ctx.remote.zcodeWorkbench.composeTask(request)),

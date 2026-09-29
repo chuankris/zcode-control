@@ -12,7 +12,8 @@
     "src/store.ts",
     "src/nodes.ts",
     "src/acp.ts",
-    "src/ingress.ts"
+    "src/ingress.ts",
+    "src/taskCenter.ts"
   ],
   "references": [
     {
